@@ -1,0 +1,16 @@
+{
+  "name": "reflection",
+  "display_name": "Reflection",
+  "version": "0.1.0",
+  "type": "ui_qml",
+  "category": "productivity",
+  "description": "Collaborative notes: p2panda Reflection on Logos Delivery. Share a note's id and edit it together. Needs reflection_core and loam_core.",
+  "view": "Main.qml",
+  "icon": "icon.png",
+  "dependencies": ["reflection_core"],
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": { "find_packages": [] }
+  }
+}

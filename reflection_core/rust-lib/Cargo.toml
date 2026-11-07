@@ -1,0 +1,32 @@
+[package]
+name = "reflection_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+# Standalone crate: the empty table keeps cargo from adopting a parent workspace.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+# Cargo.lock is committed; the builder feeds it to buildRustPackage. To regenerate it, stage the
+# SDK the path dependency below points at:
+#   nix build github:logos-co/logos-module-builder/16e2f6bd3c06a5119f8c34448933de183205646c#rust-sdk-src -o logos-rust-sdk-src
+#   (cd rust-lib && cargo generate-lockfile)
+
+[dependencies]
+# Staged by the builder from the same logos-rust-sdk revision as its code generator.
+logos-rust-sdk = { path = "../logos-rust-sdk-src" }
+reflection-node = { git = "https://github.com/vpavlin/reflection", rev = "b462c31d7c852ef232bbe7b51ca5d1a188818f6e", features = ["logos"] }
+p2panda = "0.7.0"
+p2panda-core = "0.7.0"
+# Same Loro as reflection-doc, so documents interoperate with the GTK app.
+loro = "=1.13.9"
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

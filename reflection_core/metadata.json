@@ -1,0 +1,27 @@
+{
+  "name": "reflection_core",
+  "display_name": "Reflection Core",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "productivity",
+  "description": "Engine of Reflection notes for Basecamp: p2panda Reflection documents (Loro text) synced over Logos Delivery through loam_core.",
+  "main": "reflection_core_plugin",
+  "dependencies": ["loam_core"],
+
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "ReflectionCoreModule" }
+  },
+
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": [],
+      "extra_link_libraries": []
+    },
+    "rust": { "toolchain": "1.97.1" }
+  }
+}
