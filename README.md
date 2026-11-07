@@ -13,12 +13,21 @@ Share a note's id with someone; whoever has it can read and edit the note with y
 
 Needs `loam_core` (0.7.x) and its `delivery_module` in the same Basecamp.
 
-## Interop with the GTK app
+## Interop with upstream Reflection (p2panda)
 
-Documents are the same: same document id, same Loro container and the same operations. A GTK
-Reflection built from the fork with `--features logos-ffi` and started with
-`REFLECTION_BACKEND=logos REFLECTION_LOGOS_LIB=/path/to/liblogosdelivery.so` joins the same
-network (Logos test network, RLN off) and edits the same notes. Paste the hex id.
+Notes are the same p2panda documents on both networks. A **bridge** node joins the two: a
+Reflection built from the [fork](https://github.com/vpavlin/reflection/tree/feat/logos-delivery)
+with `--features logos-ffi` and started with
+
+```sh
+REFLECTION_BACKEND=bridge REFLECTION_LOGOS_LIB=/path/to/liblogosdelivery.so ...
+```
+
+is on p2panda (like upstream Reflection) and on the Logos test network (like this app) at once,
+and relays the notes it has open in both directions
+([ADR 0007](https://github.com/vpavlin/reflection/blob/feat/logos-delivery/docs/logos/adr/0007-bridge.md)).
+Tested headless on the real networks: Basecamp <-> bridge <-> p2panda, live edits in 1-2 s.
+`REFLECTION_BACKEND=logos` instead makes the GTK app a plain Logos peer of this app.
 
 ## Building
 
