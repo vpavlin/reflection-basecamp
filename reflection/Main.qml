@@ -286,6 +286,8 @@ Item {
         Rectangle {
             Layout.fillHeight: true
             Layout.preferredWidth: 270
+            Layout.minimumWidth: 270
+            Layout.maximumWidth: 270
             color: root.cSurface
 
             ColumnLayout {
@@ -300,13 +302,13 @@ Item {
                     Layout.fillWidth: true
                     spacing: 6
                     RField { id: newTitle; placeholderText: "New note title"; onAccepted: root.createDoc() }
-                    LogosButton { text: root.creating ? "..." : "New"; enabled: !root.creating; onClicked: root.createDoc() }
+                    LogosButton { text: root.creating ? "..." : "New"; Layout.preferredWidth: 64; Layout.preferredHeight: 34; enabled: !root.creating; onClicked: root.createDoc() }
                 }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 6
                     RField { id: joinField; placeholderText: "Paste a note id to join"; onAccepted: root.joinDoc() }
-                    LogosButton { text: root.joining ? "..." : "Join"; enabled: !root.joining; onClicked: root.joinDoc() }
+                    LogosButton { text: root.joining ? "..." : "Join"; Layout.preferredWidth: 64; Layout.preferredHeight: 34; enabled: !root.joining; onClicked: root.joinDoc() }
                 }
 
                 Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
@@ -384,6 +386,8 @@ Item {
         // ── the open note
         ColumnLayout {
             Layout.fillWidth: true
+            Layout.minimumWidth: 300
+            Layout.maximumWidth: 100000
             Layout.fillHeight: true
             Layout.margins: 16
             spacing: 10
@@ -416,8 +420,8 @@ Item {
                         }
                     }
                 }
-                LogosButton { text: "Copy id"; onClicked: root.copy(root.currentId) }
-                LogosButton { text: root.confirmRemove ? "Click again to remove" : "Remove"; onClicked: root.removeDoc() }
+                LogosButton { text: "Copy id"; Layout.preferredWidth: 96; Layout.preferredHeight: 34; onClicked: root.copy(root.currentId) }
+                LogosButton { text: root.confirmRemove ? "Really remove?" : "Remove"; Layout.preferredWidth: 120; Layout.preferredHeight: 34; onClicked: root.removeDoc() }
             }
 
             Rectangle {
@@ -454,6 +458,7 @@ Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 visible: root.currentId === ""
+                Layout.maximumWidth: 100000
                 spacing: 8
                 Item { Layout.fillHeight: true }
                 Text {

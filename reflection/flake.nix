@@ -3,6 +3,9 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder/16e2f6bd3c06a5119f8c34448933de183205646c";
+    # Only the core's contract (LIDL) is used. A GitHub ref, not path:../, so CI can build it.
+    reflection_core.url = "github:vpavlin/reflection-basecamp/a4c510f8801b82f0eb94712315699863815d2ed2?dir=reflection_core";
+    reflection_core.inputs.logos-module-builder.follows = "logos-module-builder";
   };
 
   outputs = inputs@{ logos-module-builder, ... }:
