@@ -88,14 +88,15 @@ impl Engine {
 
     /// Everything the view shows: the document list, and the open document if `doc_id` is set.
     pub fn state(&self, doc_id: &str) -> Value {
+        let me = self.inner.me.lock().unwrap().clone().unwrap_or_default();
         let docs: Vec<Arc<Doc>> = self.inner.docs.lock().unwrap().values().cloned().collect();
-        let mut list: Vec<Value> = docs.iter().map(|doc| doc.summary()).collect();
+        let mut list: Vec<Value> = docs.iter().map(|doc| doc.summary(&me)).collect();
         list.sort_by(|a, b| b["updated"].as_u64().cmp(&a["updated"].as_u64()));
         let current = if doc_id.is_empty() {
             Value::Null
         } else {
             match self.doc(doc_id) {
-                Some(doc) => doc.detail(),
+                Some(doc) => doc.detail(&me),
                 None => Value::Null,
             }
         };
@@ -123,7 +124,11 @@ impl Engine {
             doc.local_edit(None, &format!("{title}\n"))?;
         }
         self.add(doc.clone());
-        Ok(json!({ "ok": true, "id": doc.hex(), "current": doc.detail() }))
+        Ok(json!({ "ok": true, "id": doc.hex(), "current": doc.detail(&self.me()) }))
+    }
+
+    fn me(&self) -> String {
+        self.inner.me.lock().unwrap().clone().unwrap_or_default()
     }
 
     /// Open a document someone shared, by its id (64 hex characters).
@@ -131,11 +136,11 @@ impl Engine {
         let id = parse_id(id_hex)?;
         let hex = hex::encode(id);
         if let Some(doc) = self.doc(&hex) {
-            return Ok(json!({ "ok": true, "id": hex, "current": doc.detail() }));
+            return Ok(json!({ "ok": true, "id": hex, "current": doc.detail(&self.me()) }));
         }
         let doc = Doc::new(id);
         self.add(doc.clone());
-        Ok(json!({ "ok": true, "id": hex, "current": doc.detail() }))
+        Ok(json!({ "ok": true, "id": hex, "current": doc.detail(&self.me()) }))
     }
 
     /// The user's text, edited from version `base` of the document. See `Doc::local_edit`.
@@ -154,7 +159,7 @@ impl Engine {
             let doc = doc.clone();
             self.rt.spawn(async move { doc.publish(update).await });
         }
-        let mut detail = doc.detail();
+        let mut detail = doc.detail(&self.me());
         detail["editVersion"] = json!(edit.edit_version.to_string());
         Ok(json!({ "ok": true, "current": detail }))
     }
@@ -538,24 +543,35 @@ impl Doc {
         }
     }
 
-    fn summary(&self) -> Value {
+    /// Other people with the document open (presence includes this device itself).
+    fn others_online(&self, me: &str) -> Vec<String> {
+        self.online
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| key.as_str() != me)
+            .cloned()
+            .collect()
+    }
+
+    fn summary(&self, me: &str) -> Value {
         json!({
             "id": self.hex(),
             "name": self.display_name(),
-            "online": self.online.lock().unwrap().len(),
+            "online": self.others_online(me).len(),
             "updated": self.updated.load(Ordering::SeqCst),
             "subscribed": self.stream.lock().unwrap().is_some(),
         })
     }
 
-    fn detail(&self) -> Value {
+    fn detail(&self, me: &str) -> Value {
         let text = Self::text(&self.loro.lock().unwrap());
         json!({
             "id": self.hex(),
             "name": self.display_name(),
             "text": text,
             "version": self.current_version().to_string(),
-            "online": self.online.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+            "online": self.others_online(me),
             "subscribed": self.stream.lock().unwrap().is_some(),
         })
     }
@@ -706,6 +722,16 @@ mod tests {
         let base = version(&b, &id);
         b.set_text(&id, &base, "Shopping\n- milk\n").unwrap();
         wait_for(&a, &id, "Shopping\n- milk\n");
+
+        // Presence lists the other person, not this device.
+        let b_me = b.state("")["me"].clone();
+        for _ in 0..200 {
+            if a.state(&id)["current"]["online"] == json!([b_me]) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("A sees online: {}", a.state(&id)["current"]["online"]);
     }
 
     #[test]
