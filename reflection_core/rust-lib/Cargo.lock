@@ -4203,7 +4203,7 @@ dependencies = [
 [[package]]
 name = "reflection-node"
 version = "0.5.0"
-source = "git+https://github.com/vpavlin/reflection?rev=4bb4c4ebb1ba486616bc9b33e9312be312fe87e4#4bb4c4ebb1ba486616bc9b33e9312be312fe87e4"
+source = "git+https://github.com/vpavlin/reflection?rev=bb802806850984d723b72e6d86f8b907b1217522#bb802806850984d723b72e6d86f8b907b1217522"
 dependencies = [
  "chacha20poly1305",
  "chrono",

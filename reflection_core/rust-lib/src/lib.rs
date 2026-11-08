@@ -27,13 +27,20 @@ pub trait ReflectionCoreModule: Send + 'static {
     /// Stop syncing a note and forget it on this device.
     fn remove_document(&mut self, doc_id: String) -> String;
 
+    /// Debug: messages this device sent and received over Logos Delivery, per RLN epoch and per
+    /// note, with the budget the engine plans for.
+    fn stats(&mut self) -> String;
+
     /// Called once the module is wired to the host.
     #[cfg(not(test))]
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
 
 #[cfg(not(test))]
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/provider_gen.rs"
+));
 
 #[cfg(not(test))]
 mod module;

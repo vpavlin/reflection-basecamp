@@ -55,6 +55,10 @@ impl ReflectionCoreModule for Core {
         self.with_engine(|e| e.set_text(&doc_id, &base_version, &text))
     }
 
+    fn stats(&mut self) -> String {
+        self.with_engine(|e| Ok(e.stats()))
+    }
+
     fn remove_document(&mut self, doc_id: String) -> String {
         self.with_engine(|e| e.remove(&doc_id))
     }
@@ -69,7 +73,11 @@ impl ReflectionCoreModule for Core {
         } else {
             PathBuf::from(&ctx.instance_persistence_path)
         };
-        info!("reflection_core {} starting, data in {}", env!("CARGO_PKG_VERSION"), persist.display());
+        info!(
+            "reflection_core {} starting, data in {}",
+            env!("CARGO_PKG_VERSION"),
+            persist.display()
+        );
 
         let (bus, commands) = LoamBus::new();
         let engine = Arc::new(Engine::start(persist, bus.clone()));
@@ -109,9 +117,7 @@ fn spawn_receiver(bus: Arc<LoamBus>) {
                 Ok(subscription) => {
                     info!("listening to loam_core");
                     for event in subscription {
-                        if let Some(received) =
-                            loam_core::LoamCoreClient::decode_received(&event)
-                        {
+                        if let Some(received) = loam_core::LoamCoreClient::decode_received(&event) {
                             bus.deliver(received.topic, &received.payload_b64);
                         }
                     }
@@ -170,8 +176,10 @@ impl LoamApi for GeneratedLoam {
 }
 
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("REFLECTION_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("reflection_core=info,reflection_node=info"));
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_env("REFLECTION_LOG").unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("reflection_core=info,reflection_node=info")
+        });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

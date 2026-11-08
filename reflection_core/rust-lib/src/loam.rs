@@ -111,11 +111,7 @@ const MAX_QUEUED: usize = 2000;
 
 /// The transport thread: start loam_core, wait until it is connected, then join and send.
 /// `report` receives the transport state for the view.
-pub fn run<A: LoamApi>(
-    mut api: A,
-    commands: mpsc::Receiver<Command>,
-    report: impl Fn(Value),
-) {
+pub fn run<A: LoamApi>(mut api: A, commands: mpsc::Receiver<Command>, report: impl Fn(Value)) {
     let mut joined: BTreeSet<String> = BTreeSet::new();
     let mut queue: Vec<(String, Vec<u8>)> = Vec::new();
     let mut connected = false;

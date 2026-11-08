@@ -5,6 +5,12 @@
 //! container `document`, local changes published as Loro updates ("deltas"), and a Loro snapshot
 //! published as a prune a few seconds after the last change.
 //!
+//! Message budget (RLN): Logos Delivery charges per message published, so the engine publishes
+//! as little as it can (reflection ADR 0008). Every note is subscribed in the background, which
+//! receives and costs nothing; only the note open in the view is active (presence, catch-up).
+//! Local edits are merged and published at most once per `publish_interval`, and one snapshot
+//! follows after the user stops typing.
+//!
 //! Threading: every public method is called on the host's module thread and returns quickly.
 //! Anything that touches the network or the database runs on the engine's own tokio runtime.
 //! Nothing here waits for the transport, which itself waits for the module thread (Logos IPC).
@@ -12,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use loro::{ExportMode, Frontiers, LoroDoc, UpdateOptions};
+use loro::{ExportMode, Frontiers, LoroDoc, UpdateOptions, VersionVector};
 use p2panda::{Hash, SigningKey, Topic, VerifyingKey};
 use reflection_node::logos::DeliveryBus;
 use reflection_node::{Node, TopicStream, TopicSubscription, TopicSubscriptionError};
@@ -29,8 +35,22 @@ static TEXT_ID: LazyLock<loro::ContainerID> =
 /// Reflection's network id (`reflection-doc`: `Hash::digest(b"reflection-v2")`).
 const NETWORK_NAME: &[u8] = b"reflection-v2";
 
-/// `reflection-doc` publishes a snapshot this long after the last change.
-const SNAPSHOT_DELAY: Duration = Duration::from_secs(5);
+/// A snapshot is published once the user has stopped typing for this long.
+const SNAPSHOT_QUIET: Duration = Duration::from_secs(10);
+
+/// Messages per RLN epoch (10 minutes) the engine plans for. The smallest membership allows
+/// 100, shared with every other app on the node, so edits slow down well before that.
+pub const EPOCH_BUDGET: u64 = 100;
+
+/// Merged local edits are published at most this often...
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
+/// ...this often once half the epoch budget is used...
+const PUBLISH_INTERVAL_HALF: Duration = Duration::from_secs(10);
+/// ...and this often past 80 %.
+const PUBLISH_INTERVAL_LOW: Duration = Duration::from_secs(30);
+
+/// The view polls `state` every second; without a poll for this long, nothing is open.
+const VIEW_GONE: Duration = Duration::from_secs(20);
 
 /// Versions the view may still edit from.
 const KEPT_VERSIONS: usize = 256;
@@ -52,6 +72,11 @@ struct Inner {
     docs: Mutex<BTreeMap<String, Arc<Doc>>>,
     me: Mutex<Option<String>>,
     transport: Mutex<Value>,
+    /// The note open in the view, and when the view last asked.
+    active: Mutex<Option<String>>,
+    last_poll: Mutex<Instant>,
+    /// The note whose stream is active now; changed only by `apply_active`, one at a time.
+    applied: tokio::sync::Mutex<Option<String>>,
 }
 
 impl Engine {
@@ -70,6 +95,9 @@ impl Engine {
             docs: Mutex::new(BTreeMap::new()),
             me: Mutex::new(None),
             transport: Mutex::new(json!({ "status": "starting" })),
+            active: Mutex::new(None),
+            last_poll: Mutex::new(Instant::now()),
+            applied: tokio::sync::Mutex::new(None),
         });
         let task_inner = inner.clone();
         rt.spawn(async move {
@@ -78,7 +106,67 @@ impl Engine {
                 *task_inner.node_error.lock().unwrap() = Some(error);
             }
         });
+        // The view closed: deactivate its note.
+        let watch_inner = inner.clone();
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if watch_inner.last_poll.lock().unwrap().elapsed() > VIEW_GONE {
+                    *watch_inner.active.lock().unwrap() = None;
+                    watch_inner.apply_active().await;
+                }
+            }
+        });
         Self { rt, inner }
+    }
+
+    /// The note open in the view (`""` for none). Only that one publishes presence and asks
+    /// for catch-up.
+    fn view_opened(&self, doc_id: &str) {
+        *self.inner.last_poll.lock().unwrap() = Instant::now();
+        let key = doc_id.trim().trim_matches('"').to_lowercase();
+        let wanted = (!key.is_empty() && self.doc(&key).is_some()).then_some(key);
+        {
+            let mut active = self.inner.active.lock().unwrap();
+            if *active == wanted {
+                return;
+            }
+            *active = wanted;
+        }
+        let inner = self.inner.clone();
+        self.rt.spawn(async move { inner.apply_active().await });
+    }
+
+    /// Message counters, for the debug panel: what this device sent and received over Logos
+    /// Delivery, per RLN epoch and per note.
+    pub fn stats(&self) -> Value {
+        let stats = self
+            .inner
+            .node
+            .get()
+            .and_then(|node| node.transport_stats());
+        let names: BTreeMap<String, String> = self
+            .inner
+            .docs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, doc)| (id.clone(), doc.display_name()))
+            .collect();
+        let sent = stats
+            .as_ref()
+            .map(|s| s.sent_this_epoch.messages())
+            .unwrap_or(0);
+        json!({
+            "ok": true,
+            "budget": EPOCH_BUDGET,
+            "publishInterval": publish_interval(sent).as_secs(),
+            "snapshotQuiet": SNAPSHOT_QUIET.as_secs(),
+            "active": *self.inner.active.lock().unwrap(),
+            "names": names,
+            "transport": *self.inner.transport.lock().unwrap(),
+            "stats": stats,
+        })
     }
 
     /// Transport state shown to the user (set by the module from loam_core).
@@ -88,6 +176,7 @@ impl Engine {
 
     /// Everything the view shows: the document list, and the open document if `doc_id` is set.
     pub fn state(&self, doc_id: &str) -> Value {
+        self.view_opened(doc_id);
         let me = self.inner.me.lock().unwrap().clone().unwrap_or_default();
         let docs: Vec<Arc<Doc>> = self.inner.docs.lock().unwrap().values().cloned().collect();
         let mut list: Vec<Value> = docs.iter().map(|doc| doc.summary(&me)).collect();
@@ -100,7 +189,10 @@ impl Engine {
                 None => Value::Null,
             }
         };
-        let node = match (&*self.inner.node_error.lock().unwrap(), self.inner.node.get()) {
+        let node = match (
+            &*self.inner.node_error.lock().unwrap(),
+            self.inner.node.get(),
+        ) {
             (Some(error), _) => format!("error: {error}"),
             (None, Some(_)) => "ready".to_owned(),
             (None, None) => "starting".to_owned(),
@@ -155,9 +247,10 @@ impl Engine {
         let doc = self.doc(doc_id).ok_or("No such note")?;
         let base = base.trim().trim_matches('"').parse::<u64>().ok();
         let edit = doc.local_edit(base, text)?;
-        if let Some(update) = edit.update {
+        if edit.changed {
+            let interval = self.inner.publish_interval();
             let doc = doc.clone();
-            self.rt.spawn(async move { doc.publish(update).await });
+            self.rt.spawn(async move { doc.request_publish(interval) });
         }
         let mut detail = doc.detail(&self.me());
         detail["editVersion"] = json!(edit.edit_version.to_string());
@@ -173,7 +266,16 @@ impl Engine {
             .unwrap()
             .remove(doc_id)
             .ok_or("No such note")?;
+        {
+            let mut active = self.inner.active.lock().unwrap();
+            if active.as_deref() == Some(doc.hex().as_str()) {
+                *active = None;
+            }
+        }
         let inner = self.inner.clone();
+        let deactivate = inner.clone();
+        self.rt
+            .spawn(async move { deactivate.apply_active().await });
         self.rt.spawn(async move {
             let stream = doc.stream.lock().unwrap().take();
             if let Some(stream) = stream {
@@ -204,7 +306,7 @@ impl Engine {
         let inner = self.inner.clone();
         self.rt.spawn(async move {
             if let Some(node) = inner.node.get() {
-                Inner::subscribe(node, doc).await;
+                inner.subscribe(node, doc).await;
             }
             // Otherwise start_node subscribes every document once the node is up.
         });
@@ -218,7 +320,10 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!("node did not start: {:?}", self.inner.node_error.lock().unwrap());
+        panic!(
+            "node did not start: {:?}",
+            self.inner.node_error.lock().unwrap()
+        );
     }
 }
 
@@ -227,7 +332,9 @@ impl Drop for Engine {
         // Leave the runtime's threads to finish on their own; the host is unloading us.
         let rt = std::mem::replace(
             &mut self.rt,
-            tokio::runtime::Builder::new_current_thread().build().unwrap(),
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
         );
         rt.shutdown_background();
     }
@@ -243,9 +350,10 @@ impl Inner {
         let key = load_or_create_key(&persist_dir)?;
         *self.me.lock().unwrap() = Some(key.verifying_key().to_hex());
 
-        let node = Node::with_delivery_bus(key, Hash::digest(NETWORK_NAME), Some(&persist_dir), bus)
-            .await
-            .map_err(|e| e.to_string())?;
+        let node =
+            Node::with_delivery_bus(key, Hash::digest(NETWORK_NAME), Some(&persist_dir), bus)
+                .await
+                .map_err(|e| e.to_string())?;
 
         // Documents known from earlier runs. Their content comes back from the node's
         // operation store when we subscribe.
@@ -271,22 +379,64 @@ impl Inner {
 
         let docs: Vec<Arc<Doc>> = self.docs.lock().unwrap().values().cloned().collect();
         for doc in docs {
-            Self::subscribe(node, doc).await;
+            self.subscribe(node, doc).await;
         }
         Ok(())
     }
 
-    async fn subscribe(node: &Node, doc: Arc<Doc>) {
+    /// How long to wait between publishing merged edits, given what this device already sent
+    /// in the current epoch.
+    fn publish_interval(&self) -> Duration {
+        let sent = self
+            .node
+            .get()
+            .and_then(|node| node.transport_stats())
+            .map(|s| s.sent_this_epoch.messages())
+            .unwrap_or(0);
+        publish_interval(sent)
+    }
+
+    /// Make the streams match `active`, the note the view has open. Calls are serialized and
+    /// each applies the latest wish, so quick switches can't leave the wrong note active.
+    async fn apply_active(&self) {
+        let mut applied = self.applied.lock().await;
+        let wanted = self.active.lock().unwrap().clone();
+        if *applied == wanted {
+            return;
+        }
+        let find = |id: &Option<String>| {
+            id.as_ref()
+                .and_then(|id| self.docs.lock().unwrap().get(id).cloned())
+                .and_then(|doc| doc.stream.lock().unwrap().clone())
+        };
+        if let Some(stream) = find(&applied) {
+            stream.set_active(false).await;
+        }
+        // A note that isn't subscribed yet is activated once it is (see `subscribe`).
+        *applied = match find(&wanted) {
+            Some(stream) => {
+                stream.set_active(true).await;
+                wanted
+            }
+            None => None,
+        };
+    }
+
+    async fn subscribe(&self, node: &Node, doc: Arc<Doc>) {
         if doc.subscribing.swap(true, Ordering::SeqCst) {
             return;
         }
         let subscription = DocSubscription {
             doc: Arc::downgrade(&doc),
         };
-        match node.stream(Topic::from(doc.id), subscription).await {
+        match node
+            .stream_in_background(Topic::from(doc.id), subscription)
+            .await
+        {
             Ok(stream) => {
                 *doc.stream.lock().unwrap() = Some(Arc::new(stream));
                 info!(doc = %doc.hex(), "note subscribed");
+                self.apply_active().await;
                 // Changes made before the node was up have not been published yet.
                 if doc.unpublished.swap(false, Ordering::SeqCst) {
                     doc.clone().publish_snapshot().await;
@@ -309,15 +459,20 @@ pub struct Doc {
     stream: Mutex<Option<Arc<TopicStream<DocSubscription>>>>,
     subscribing: AtomicBool,
     unpublished: AtomicBool,
-    snapshot_scheduled: AtomicBool,
+    /// Our own Loro changes up to this counter have been published.
+    published_counter: Mutex<i32>,
+    publish_scheduled: AtomicBool,
+    last_publish: Mutex<Option<Instant>>,
+    /// Bumped on every publish; a snapshot is due when it stops changing.
+    edit_generation: AtomicU64,
     online: Mutex<BTreeSet<String>>,
     name: Mutex<String>,
     updated: AtomicU64,
 }
 
 pub struct LocalEdit {
-    /// The Loro update to publish, if the text changed.
-    update: Option<Vec<u8>>,
+    /// Whether the text changed (and there is something to publish).
+    changed: bool,
     /// A version whose text is exactly what the view sent.
     edit_version: u64,
 }
@@ -332,7 +487,10 @@ impl Doc {
             stream: Mutex::new(None),
             subscribing: AtomicBool::new(false),
             unpublished: AtomicBool::new(false),
-            snapshot_scheduled: AtomicBool::new(false),
+            published_counter: Mutex::new(0),
+            publish_scheduled: AtomicBool::new(false),
+            last_publish: Mutex::new(None),
+            edit_generation: AtomicU64::new(0),
             online: Mutex::new(BTreeSet::new()),
             name: Mutex::new(String::new()),
             updated: AtomicU64::new(0),
@@ -407,7 +565,7 @@ impl Doc {
                 drop(loro);
                 let v = self.current_version();
                 return Ok(LocalEdit {
-                    update: None,
+                    changed: false,
                     edit_version: v,
                 });
             }
@@ -418,7 +576,8 @@ impl Doc {
             loro.oplog_frontiers()
         } else {
             let fork = loro.fork_at(&base_frontiers).map_err(|e| e.to_string())?;
-            fork.set_peer_id(loro.peer_id()).map_err(|e| e.to_string())?;
+            fork.set_peer_id(loro.peer_id())
+                .map_err(|e| e.to_string())?;
             let fork_text = fork.get_text(&*TEXT_ID);
             if fork_text.to_string() != text {
                 fork_text
@@ -433,14 +592,7 @@ impl Doc {
             fork.oplog_frontiers()
         };
 
-        let update = if loro.oplog_vv() == before {
-            None
-        } else {
-            Some(
-                loro.export(ExportMode::updates(&before))
-                    .map_err(|e| e.to_string())?,
-            )
-        };
+        let changed = loro.oplog_vv() != before;
         let merged = loro.oplog_frontiers();
         let new_text = Self::text(&loro);
         drop(loro);
@@ -452,7 +604,7 @@ impl Doc {
             self.unpublished.store(true, Ordering::SeqCst);
         }
         Ok(LocalEdit {
-            update,
+            changed,
             edit_version,
         })
     }
@@ -477,6 +629,12 @@ impl Doc {
             warn!(doc = %self.hex(), "received invalid change: {error}");
             return;
         }
+        // Our own changes coming back (replayed from the store) were published before.
+        let ours = Self::own_counter(&loro);
+        {
+            let mut published = self.published_counter.lock().unwrap();
+            *published = (*published).max(ours);
+        }
         let frontiers = loro.oplog_frontiers();
         let text = Self::text(&loro);
         drop(loro);
@@ -490,41 +648,98 @@ impl Doc {
         self.updated.store(now_secs(), Ordering::SeqCst);
     }
 
-    async fn publish(self: Arc<Self>, update: Vec<u8>) {
+    /// How far this peer's own changes go (the end of its counter range).
+    fn own_counter(loro: &LoroDoc) -> i32 {
+        loro.oplog_vv().get(&loro.peer_id()).copied().unwrap_or(0)
+    }
+
+    /// There are local changes to publish. They are merged with whatever follows within
+    /// `interval` of the last publish and sent as one Loro update.
+    fn request_publish(self: Arc<Self>, interval: Duration) {
+        if self.publish_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let wait = match *self.last_publish.lock().unwrap() {
+            Some(at) => interval.saturating_sub(at.elapsed()),
+            None => Duration::ZERO,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            self.publish_scheduled.store(false, Ordering::SeqCst);
+            self.publish_pending().await;
+        });
+    }
+
+    async fn publish_pending(self: Arc<Self>) {
         let stream = self.stream.lock().unwrap().clone();
         let Some(stream) = stream else {
             // Published as part of a snapshot once the note is subscribed.
             self.unpublished.store(true, Ordering::SeqCst);
             return;
         };
-        if let Err(error) = stream.publish_delta(update).await {
-            error!(doc = %self.hex(), "can't publish change: {error}");
+        let (update, counter) = {
+            let loro = self.loro.lock().unwrap();
+            let ours = Self::own_counter(&loro);
+            let published = *self.published_counter.lock().unwrap();
+            if ours <= published {
+                return;
+            }
+            // Everything of everyone else, and ours up to what was published: the update then
+            // holds only our new changes.
+            let mut from: VersionVector = loro.oplog_vv();
+            from.insert(loro.peer_id(), published);
+            match loro.export(ExportMode::updates(&from)) {
+                Ok(update) => (update, ours),
+                Err(error) => {
+                    error!("can't export changes: {error}");
+                    return;
+                }
+            }
+        };
+        *self.last_publish.lock().unwrap() = Some(Instant::now());
+        match stream.publish_delta(update).await {
+            Ok(()) => {
+                let mut published = self.published_counter.lock().unwrap();
+                *published = (*published).max(counter);
+            }
+            Err(error) => error!(doc = %self.hex(), "can't publish change: {error}"),
         }
         self.schedule_snapshot();
     }
 
+    /// Publish a snapshot once no edit has been published for `SNAPSHOT_QUIET`.
     fn schedule_snapshot(self: &Arc<Self>) {
-        if self.snapshot_scheduled.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let generation = self.edit_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let doc = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(SNAPSHOT_DELAY).await;
-            doc.snapshot_scheduled.store(false, Ordering::SeqCst);
-            doc.publish_snapshot().await;
+            tokio::time::sleep(SNAPSHOT_QUIET).await;
+            if doc.edit_generation.load(Ordering::SeqCst) == generation
+                && !doc.publish_scheduled.load(Ordering::SeqCst)
+            {
+                doc.publish_snapshot().await;
+            }
         });
     }
 
     async fn publish_snapshot(self: Arc<Self>) {
         let stream = self.stream.lock().unwrap().clone();
         let Some(stream) = stream else { return };
-        let snapshot = match self.loro.lock().unwrap().export(ExportMode::Snapshot) {
+        let (snapshot, counter) = {
+            let loro = self.loro.lock().unwrap();
+            (loro.export(ExportMode::Snapshot), Self::own_counter(&loro))
+        };
+        let snapshot = match snapshot {
             Ok(bytes) => bytes,
             Err(error) => {
                 error!("can't export snapshot: {error}");
                 return;
             }
         };
+        // The snapshot carries every change made so far.
+        {
+            let mut published = self.published_counter.lock().unwrap();
+            *published = (*published).max(counter);
+        }
         if let Err(error) = stream.publish_snapshot(snapshot).await {
             error!(doc = %self.hex(), "can't publish snapshot: {error}");
         }
@@ -610,8 +825,24 @@ impl TopicSubscription for DocSubscription {
     }
 }
 
+/// See `PUBLISH_INTERVAL`.
+fn publish_interval(sent_this_epoch: u64) -> Duration {
+    if sent_this_epoch * 10 >= EPOCH_BUDGET * 8 {
+        PUBLISH_INTERVAL_LOW
+    } else if sent_this_epoch * 2 >= EPOCH_BUDGET {
+        PUBLISH_INTERVAL_HALF
+    } else {
+        PUBLISH_INTERVAL
+    }
+}
+
+/// The first non-empty line, without Markdown heading marks.
 fn name_of(text: &str) -> String {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches('#').trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     line.chars().take(NAME_LENGTH).collect()
 }
 
@@ -714,7 +945,10 @@ mod tests {
         let a = device(&tempdir("a"));
         let b = device(&tempdir("b"));
 
-        let id = a.create("Shopping").unwrap()["id"].as_str().unwrap().to_owned();
+        let id = a.create("Shopping").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         b.join(&id).unwrap();
         wait_for(&b, &id, "Shopping\n");
         assert_eq!(b.state("")["docs"][0]["name"], "Shopping");
@@ -724,7 +958,7 @@ mod tests {
         wait_for(&a, &id, "Shopping\n- milk\n");
 
         // Presence lists the other person, not this device.
-        let b_me = b.state("")["me"].clone();
+        let b_me = b.state(&id)["me"].clone();
         for _ in 0..200 {
             if a.state(&id)["current"]["online"] == json!([b_me]) {
                 return;
@@ -744,7 +978,8 @@ mod tests {
 
         // B's view saw "List\n". Meanwhile A appends a line.
         let b_base = version(&b, &id);
-        a.set_text(&id, &version(&a, &id), "List\nfrom a\n").unwrap();
+        a.set_text(&id, &version(&a, &id), "List\nfrom a\n")
+            .unwrap();
         wait_for(&b, &id, "List\nfrom a\n");
 
         // B's user, not having seen it, renames the title. A's line must survive.
@@ -783,7 +1018,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("did not converge: {:?} vs {:?}", text(&a, &id), text(&b, &id));
+        panic!(
+            "did not converge: {:?} vs {:?}",
+            text(&a, &id),
+            text(&b, &id)
+        );
     }
 
     #[test]
@@ -791,7 +1030,10 @@ mod tests {
         let dir = tempdir("restart");
         let id = {
             let a = device(&dir);
-            let id = a.create("Diary").unwrap()["id"].as_str().unwrap().to_owned();
+            let id = a.create("Diary").unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             // Wait for the subscription, so the change is stored.
             for _ in 0..100 {
                 if a.state(&id)["current"]["subscribed"] == true {
@@ -799,13 +1041,70 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            a.set_text(&id, &version(&a, &id), "Diary\nday one\n").unwrap();
+            a.set_text(&id, &version(&a, &id), "Diary\nday one\n")
+                .unwrap();
             std::thread::sleep(Duration::from_millis(500));
             id
         };
         let a = device(&dir);
         wait_for(&a, &id, "Diary\nday one\n");
         assert_eq!(a.state("")["docs"][0]["name"], "Diary");
+    }
+
+    fn sent(engine: &Engine, kind: &str) -> u64 {
+        engine.stats()["stats"]["sent"][kind].as_u64().unwrap()
+    }
+
+    #[test]
+    fn typing_is_merged_into_few_messages() {
+        let a = device(&tempdir("a"));
+        let b = device(&tempdir("b"));
+        let id = a.create("").unwrap()["id"].as_str().unwrap().to_owned();
+        b.join(&id).unwrap();
+        // Both have the note open.
+        wait_for(&b, &id, "");
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Thirty keystrokes, one every 50 ms, as the view sends them.
+        let mut base = version(&a, &id);
+        let mut typed = String::new();
+        for c in "the quick brown fox jumps over".chars() {
+            typed.push(c);
+            let reply = a.set_text(&id, &base, &typed).unwrap();
+            base = reply["current"]["editVersion"].as_str().unwrap().to_owned();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        wait_for(&b, &id, &typed);
+        // 1.5 s of typing at one publish per 2 s: the first keystroke, then the rest merged.
+        assert!(sent(&a, "ops") <= 2, "{}", a.stats());
+
+        // One snapshot once the typing stopped.
+        for _ in 0..300 {
+            if sent(&a, "snapshots") >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(sent(&a, "snapshots"), 1, "{}", a.stats());
+        assert!(sent(&a, "ops") <= 2, "{}", a.stats());
+    }
+
+    #[test]
+    fn notes_not_open_send_nothing() {
+        let a = device(&tempdir("a"));
+        for title in ["one", "two", "three"] {
+            a.create(title).unwrap();
+        }
+        // The view shows the list, no note open. Creating published each note once.
+        std::thread::sleep(Duration::from_secs(2));
+        a.state("");
+        let before = a.stats()["stats"]["sent"].clone();
+        std::thread::sleep(Duration::from_secs(6));
+        a.state("");
+        assert_eq!(a.stats()["stats"]["sent"], before);
+        assert_eq!(before["heads"], 0);
+        assert_eq!(before["presence"], 0);
     }
 
     #[test]
@@ -815,5 +1114,11 @@ mod tests {
         assert!(a.join("abcd").is_err());
         let id = hex::encode([7u8; 32]);
         assert_eq!(a.join(&id.to_uppercase()).unwrap()["id"], id);
+    }
+
+    #[test]
+    fn names_drop_heading_marks() {
+        assert_eq!(name_of("\n## Plan for May\nbody"), "Plan for May");
+        assert_eq!(name_of("#\n# \nTitle"), "Title");
     }
 }
