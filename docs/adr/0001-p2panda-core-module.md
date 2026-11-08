@@ -127,7 +127,7 @@ Events carry no content:
 
 | Event | Payload |
 |---|---|
-| `pending` | `sub_hint`: a short, non-secret prefix-free tag the subscriber got from `open`, so it knows which of its subscriptions to drain (sent when one goes from empty to non-empty, at most once a second while it stays so, and not at all for abandoned subscriptions, section 6). |
+| `pending` | `tag`: a short public tag `open` returns next to the (secret) handle, so it knows which of its subscriptions to drain (sent when one goes from empty to non-empty, at most once a second while it stays so, and not at all for abandoned subscriptions, section 6). |
 | `restarted` | `api_version`: the module started; apps `open` their topics again (`open` is idempotent). |
 
 **A subscription is a cursor into the store, not a buffer.** Each subscription keeps a read
