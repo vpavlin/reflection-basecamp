@@ -2,3 +2,5 @@ target/
 result*
 reflection_core/logos-rust-sdk-src
 reflection_core/rust-lib/generated/
+p2panda_core/logos-rust-sdk-src
+p2panda_core/rust-lib/generated/

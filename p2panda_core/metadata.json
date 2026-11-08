@@ -1,0 +1,27 @@
+{
+  "name": "p2panda_core",
+  "display_name": "p2panda Core",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "network",
+  "description": "A shared p2panda node for Basecamp apps (one per app network), with an opt-in bridge of chosen topics to Logos Delivery through loam_core. See docs/adr/0001-p2panda-core-module.md.",
+  "main": "p2panda_core_plugin",
+  "dependencies": ["loam_core"],
+
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "P2pandaCoreModule" }
+  },
+
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": [],
+      "extra_link_libraries": []
+    },
+    "rust": { "toolchain": "1.97.1" }
+  }
+}

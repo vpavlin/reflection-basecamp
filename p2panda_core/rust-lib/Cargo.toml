@@ -1,0 +1,53 @@
+[package]
+name = "p2panda_core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Standalone crate: the empty table keeps cargo from adopting a parent workspace.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+# Cargo.lock is committed; the builder feeds it to buildRustPackage. To regenerate it, stage the
+# SDK the path dependency below points at:
+#   nix build github:logos-co/logos-module-builder/16e2f6bd3c06a5119f8c34448933de183205646c#rust-sdk-src -o ../logos-rust-sdk-src
+#   cargo generate-lockfile
+
+[dependencies]
+# Staged by the builder from the same logos-rust-sdk revision as its code generator.
+logos-rust-sdk = { path = "../logos-rust-sdk-src" }
+p2panda = "0.7.0"
+p2panda-core = "0.7.0"
+p2panda-store = "0.7.0"
+# The Logos Delivery protocol and bridge (MIT OR Apache-2.0).
+logos-p2panda = { git = "https://github.com/vpavlin/reflection", rev = "758fe79" }
+ciborium = "0.2.2"
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"], default-features = false }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-stream = "0.1.18"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+# p2panda 0.7.0 + one commit: push imported operations to live sync sessions, which the bridge
+# needs (vpavlin/reflection ADR 0007). Pinned; guarded by the bridge tests.
+p2panda = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-auth = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-core = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-discovery = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-encryption = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-net = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-spaces = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-store = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-stream = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+p2panda-sync = { git = "https://github.com/vpavlin/p2panda", rev = "dbbecdcd28904195db8802a79a28d1e71f341701" }
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros"] }
