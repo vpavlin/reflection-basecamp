@@ -99,8 +99,8 @@ standard base64. `network` is the 32-byte network id (hex), `topic` the 32-byte 
 
 | Method | Does |
 |---|---|
-| `open(app, network, topic, from, label)` | Subscribe to a topic. `from`: `"start"` queues every stored operation, then live ones; `"live"` only new ones; or a **cursor** from an earlier `drain`, to resume after it. Idempotent per `(app, network, topic)`. `label` is what the p2panda view shows for the topic (e.g. the note's name). |
-| `close(app, network, topic)` | Stop delivering it to this app and drop this app's queued items for it; clears this app's `set_active`. The node leaves the topic when no app has it open. |
+| `open(app, network, topic, from, label)` | Subscribe to a topic; returns a **subscription handle** (unguessable, 128-bit). `from`: `"start"`, `"live"`, or a **cursor** from an earlier `drain` to resume after it. `app` and `label` are what the p2panda view shows (e.g. "Reflection", the note's name). |
+| `close(sub)` | End the subscription; clears its `set_active` lease. The node leaves the topic when no subscription has it. |
 | `forget(app, network, topic)` | The user deleted the document: close it, delete its stored operations and its bridge state. Refused while another app has it open. |
 | `head(network, topic, author)` | The latest operation (seq, hash) of an author's log, or none. |
 | `heads(network, topic)` | The same for every author of the topic. |
@@ -120,23 +120,30 @@ per-app queue, which the app drains:
 
 | Method | Does |
 |---|---|
-| `drain(app, max)` | The oldest items of this app's queue, removed from it: at most `max` (≤ 256) and about 1 MiB, but **always at least one**, however large, so a big snapshot can't wedge the queue. Items: `{"kind": "operation", network, topic, author, seq, hash, prune, header_b64, body_b64, source, cursor}` (`source`: `"local"`, `"p2panda"`, `"logos"`), `{"kind": "ephemeral", network, topic, author, timestamp, body_b64}`, `{"kind": "sync", network, topic, remote, state}`. |
+| `drain(sub, max)` | The next items of this subscription: at most `max` (≤ 256) and about 1 MiB, but **always at least one** if any, however large, so a big snapshot can't wedge it. Returns `{items, more, pending}`; the app loops while `more` is true. Items: `{"kind": "operation", author, seq, hash, prune, header_b64, body_b64, source, cursor}` (`source`: `"local"`, `"p2panda"`, `"logos"`), `{"kind": "ephemeral", author, timestamp, body_b64}`, `{"kind": "sync", remote, state}`. |
 | `api_version()` | The API version, so an app can tell an older or newer module apart. |
 
 Events carry no content:
 
 | Event | Payload |
 |---|---|
-| `pending` | `app, count`: this app's queue has items (sent when it goes from empty to non-empty, and at most once a second while it stays so). |
+| `pending` | `sub_hint`: a short, non-secret prefix-free tag the subscriber got from `open`, so it knows which of its subscriptions to drain (sent when one goes from empty to non-empty, at most once a second while it stays so, and not at all for abandoned subscriptions, section 6). |
 | `restarted` | `api_version`: the module started; apps `open` their topics again (`open` is idempotent). |
 
-A replay (`open` with `from = "start"` or a cursor) fills the app's queue in order, batch by batch,
-as the app drains it.
+**A subscription is a cursor into the store, not a buffer.** Each subscription keeps a read
+position over the module's store (per author log) and a small read-ahead window filled from it.
+Replay (`from = "start"` or a cursor) is just reading from an earlier position; a full window
+stops reading ahead and loses nothing. Within a subscription, live operations go before its own
+replay (the topic the user is looking at stays live while history loads), and replays are filled
+round-robin across subscriptions and topics. Kinds are treated differently: operations are never
+dropped (they are in the store); ephemeral messages are lossy anyway, so they have their own small
+bound and the oldest are dropped; for `sync` only the latest state per remote is kept.
 
 **Delivery guarantee:** at least once, in order within each author's log; an app deduplicates by
 `hash`. The `cursor` of an operation item (the topic's per-author frontier up to and including it)
 is what the app stores to resume after a restart of either side or after its queue overflowed,
-instead of replaying from the start.
+instead of replaying from the start. The module also persists each subscription's position, so
+after `restarted` an app that re-opens with its last cursor continues without duplicates.
 
 The practical payload size of a Basecamp IPC call (Qt Remote Objects) gets measured before the
 drain limits are fixed; the numbers above are a starting point.
@@ -215,20 +222,24 @@ documents stay (their operations are re-imported on the other side on first open
 Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So:
 
 - **Isolation.** Basecamp module events reach every module that listens, so data never travels in
-  events: each app drains its own queue (section 3). On p2panda, operation bodies are not
+  events: each subscription is drained through its own handle (section 3), which only its caller
+  received (return values, unlike events, aren't broadcast). On p2panda, operation bodies are not
   encrypted per app (Reflection's are plain Loro updates), so broadcasting them would hand every
   app's content to every other module, and make every app decode everyone's traffic.
-- **Fairness.** Each app's queue is bounded (default 4096 items or 16 MiB). A full queue pauses
-  that app's replay and its live delivery for that app (they resume as it drains; live
-  operations are still stored and synced, the app reads them later from the store), and nothing
-  else. Replays of different apps are filled round-robin.
+- **Fairness.** Each subscription's read-ahead is bounded (default 4096 items or 16 MiB), and so is
+  the module's total (default 64 MiB): the bound is how far ahead the module reads, never a point
+  where data is lost. Live operations are always stored and synced; delivery to a slow app just
+  waits at its cursor. Replays are filled round-robin across apps and topics.
+- **Abandoned subscriptions.** A subscription not drained for 10 minutes (the app crashed, or left
+  without `close`) stops getting `pending`, releases its read-ahead and loses its `set_active`
+  lease; it continues from its cursor if the app drains it again.
 - **Failure isolation.** Every call is guarded (`catch_unwind`, typed JSON reads, size limits): a
   bad request or operation from one app fails that call only.
-- **Several instances of one app** (a view and a core, two views) must pass distinct `app` labels
-  (for example `reflection/core`), or they share one queue and take each other's items.
+- **Several instances of one app** (a view and a core, two views) each get their own subscription
+  handles, so they don't take each other's items.
 - **Per-app limits:** topics open (default 200), bridged topics (20), queue size (above).
-- **`pending` is broadcast** with the app label and a count: other modules can see that an app has
-  traffic, not what. Apps drain until the queue is empty, not once per event.
+- **`pending` is broadcast** with a non-secret tag: other modules can see that some subscription has
+  traffic, not what. Apps drain until `more` is false, not once per event.
 - **Residual risk.** Anything that can read the user's process memory or the IPC socket gets a
   signing key in a session as it would in any design where another process signs. Only `import`
   (the app signs, possibly through the OS keyring) avoids that.
@@ -237,10 +248,11 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
   as anyone on the network can: topic ids are the secret.
 - **Restarts and upgrades are for everyone.** The module announces `restarted`; apps open again.
   `api_version` lets an app refuse or adapt to a module it doesn't support.
-- **Trust boundary.** All Basecamp modules run as the user, and `app` is a label the caller
-  passes, so a hostile module on the device could drain another app's queue. Per-app queues stop
-  accidental leaks and cross-traffic, not a malicious module on the user's own machine; apps
-  that need more encrypt their bodies.
+- **Trust boundary.** All Basecamp modules run as the user. Subscription and signer handles reach
+  only their caller, so another module can't drain a subscription or sign with a session it
+  wasn't given; but `app` is still an unauthenticated label, and a module that knows a topic id
+  can open its own subscription to it, as anyone on the network can. Apps that need more than
+  "whoever has the topic id" encrypt their bodies.
 
 ## Alternatives considered
 
@@ -303,7 +315,9 @@ that don't share it.
 
 Taken in: repair cap against remote budget draining; bridge requests confirmed in the p2panda
 view; `head`/`heads` and per-author write serialization for `import`; cursors and an
-at-least-once guarantee instead of full replays; keys by `(app, network, topic)`; the at-least-one
+at-least-once guarantee instead of full replays; subscriptions as cursors into the store with
+subscription handles, `{items, more}` drains, live-before-replay, lossy ephemerals and abandoned
+subscriptions (second review of section 6); keys by `(app, network, topic)`; the at-least-one
 rule for `drain`; distinct labels per app instance; `forget`; `set_active` leases; `pending`
 metadata stated; size check for bridged topics; no logging of arguments and key zeroizing;
 `import` as the recommended path and signer sessions instead of per-call keys; per-document keys
