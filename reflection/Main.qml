@@ -27,7 +27,16 @@ Item {
     readonly property color cAccent: tok(pal.primary, "#ff7a3d")
     readonly property color cOk: tok(pal.success, "#5fbf7f")
     readonly property color cBad: tok(pal.error, "#ef6f6c")
-    readonly property string viewVersion: "0.1.0"
+    readonly property color cCode: tok(pal.success, "#7fc79a")
+    readonly property color cLink: "#8ab4f8"
+    readonly property color cEmph: "#e9b97a"
+    readonly property string viewVersion: "0.2.0"
+
+    // Build switches. `debugTools` shows the message-stats button (how many Logos messages this
+    // device sends, mapped to the RLN budget); set it to false for a build without it.
+    readonly property bool debugTools: true
+    // Colour Markdown syntax while editing (the text stays plain; nothing is rendered).
+    readonly property bool markdownColours: true
 
     // ── core bridge (never blocking: callModuleAsync, or callModule deferred a frame)
     readonly property string coreName: "reflection_core"
@@ -266,6 +275,71 @@ Item {
     }
     function statusGood() { return !!root.transport.connected && String(root.st.node) === "ready" }
 
+    // ── message stats (debug)
+    property bool showStats: false
+    property var stats: null
+    property string statsError: ""
+    function refreshStats() {
+        root.core("stats", [], function (raw) {
+            var r = root.parse(raw)
+            if (r && r.ok) { root.stats = r; root.statsError = "" }
+            else root.statsError = (r && r.error) ? r.error : "This reflection_core has no stats (update it)"
+        })
+    }
+    Timer { interval: 2000; running: root.showStats; repeat: true; triggeredOnStart: true; onTriggered: root.refreshStats() }
+    function kb(bytes) { return bytes >= 1024 ? (Math.round(bytes / 102.4) / 10) + " KB" : bytes + " B" }
+    function total(c) {
+        if (!c) return 0
+        return (c.ops || 0) + (c.snapshots || 0) + (c.heads || 0) + (c.repairs || 0) + (c.relayed || 0) + (c.presence || 0) + (c.cursors || 0)
+    }
+    function ago(s) { return s < 60 ? s + " s ago" : (s < 3600 ? Math.floor(s / 60) + " min ago" : Math.floor(s / 3600) + " h ago") }
+    function clock(s) { return Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2) }
+
+    // ── Markdown colours: the editor's own text is transparent, and a coloured copy of it is
+    // drawn underneath with the same font and wrapping. Colour only: a bold or larger glyph
+    // would move the text away from the editor's cursor.
+    function esc(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") }
+    function span(c, t) { return t === "" ? "" : "<span style=\"color:" + c + "\">" + t + "</span>" }
+    function mdInline(raw) {
+        var e = root.esc(raw)
+        var re = /(`+)([^`]+?)\1|(\*\*|__)(\S(?:.*?\S)?)\3|(\*|_)(\S(?:.*?\S)?)\5|\[([^\]]+)\]\(([^)\s]+)\)/g
+        return e.replace(re, function (m, tick, code, b, btxt, i, itxt, ltxt, lurl, offset, str) {
+            if (tick) return root.span(root.cCode, m)
+            if (b) return root.span(root.cFaint, b) + root.span(root.cEmph, btxt) + root.span(root.cFaint, b)
+            if (i) {
+                // snake_case and 2*3*4 are not emphasis.
+                if (offset > 0 && /\w/.test(str.charAt(offset - 1))) return m
+                return root.span(root.cFaint, i) + root.span(root.cEmph, itxt) + root.span(root.cFaint, i)
+            }
+            if (ltxt) return root.span(root.cFaint, "[") + root.span(root.cLink, ltxt) + root.span(root.cFaint, "](" + lurl + ")")
+            return m
+        })
+    }
+    function mdHtml(text) {
+        var lines = text.split("\n")
+        var out = []
+        var fence = false
+        for (var n = 0; n < lines.length; n++) {
+            var l = lines[n]
+            var m
+            if (/^\s*(```|~~~)/.test(l)) { fence = !fence; out.push(root.span(root.cFaint, root.esc(l))); continue }
+            if (fence) { out.push(root.span(root.cCode, root.esc(l))); continue }
+            if ((m = /^(#{1,6})(\s.*|)$/.exec(l))) { out.push(root.span(root.cFaint, m[1]) + root.span(root.cAccent, root.esc(m[2]))); continue }
+            if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)) { out.push(root.span(root.cFaint, root.esc(l))); continue }
+            if ((m = /^(\s*)(>+)(.*)$/.exec(l))) { out.push(m[1] + root.span(root.cAccent, root.esc(m[2])) + root.span(root.cSub, root.mdInline(m[3]))); continue }
+            if ((m = /^(\s*)([-*+]|\d+[.)])(\s+)(\[[ xX]\]\s)?(.*)$/.exec(l))) {
+                out.push(m[1] + root.span(root.cAccent, root.esc(m[2])) + m[3]
+                         + (m[4] ? root.span(/x/i.test(m[4]) ? root.cCode : root.cFaint, m[4]) : "")
+                         + root.mdInline(m[5]))
+                continue
+            }
+            out.push(root.mdInline(l))
+        }
+        return "<div style=\"white-space:pre-wrap\">" + out.join("\n") + "</div>"
+    }
+    readonly property bool mdOn: root.markdownColours && editor.text.length > 0 && editor.text.length < 30000
+                                 && !editor.inputMethodComposing
+
     component RField: TextField {
         Layout.fillWidth: true
         color: root.cText
@@ -372,11 +446,25 @@ Item {
                     wrapMode: Text.Wrap
                     maximumLineCount: 3
                 }
-                RLabel {
+                RowLayout {
                     Layout.fillWidth: true
-                    color: root.cFaint
-                    font.pixelSize: 10
-                    text: "view " + root.viewVersion + (root.st.me ? (" - you are " + String(root.st.me).substring(0, 8)) : "")
+                    spacing: 6
+                    RLabel {
+                        Layout.fillWidth: true
+                        color: root.cFaint
+                        font.pixelSize: 10
+                        text: "view " + root.viewVersion + (root.st.me ? (" - you are " + String(root.st.me).substring(0, 8)) : "")
+                    }
+                    Text {
+                        id: statsLink
+                        visible: root.debugTools
+                        text: root.showStats ? "Hide stats" : "Message stats"
+                        color: statsHover.containsMouse ? root.cAccent : root.cSub
+                        font.pixelSize: 10
+                        font.underline: true
+                        textFormat: Text.PlainText
+                        MouseArea { id: statsHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.showStats = !root.showStats }
+                    }
                 }
             }
         }
@@ -441,7 +529,9 @@ Item {
                     TextArea {
                         id: editor
                         wrapMode: TextEdit.Wrap
-                        color: root.cText
+                        color: root.mdOn ? "transparent" : root.cText
+                        selectedTextColor: root.cText
+                        selectionColor: Qt.rgba(root.cAccent.r, root.cAccent.g, root.cAccent.b, 0.35)
                         selectByMouse: true
                         font.pixelSize: 15
                         padding: 14
@@ -450,6 +540,20 @@ Item {
                         textFormat: TextEdit.PlainText
                         background: null
                         onTextChanged: if (!root.applyingRemote && root.currentId !== "") debounce.restart()
+
+                        Text {
+                            id: mdLayer
+                            z: -1
+                            visible: root.mdOn
+                            x: editor.leftPadding
+                            y: editor.topPadding
+                            width: editor.width - editor.leftPadding - editor.rightPadding
+                            font: editor.font
+                            wrapMode: Text.Wrap
+                            color: root.cText
+                            textFormat: Text.RichText
+                            text: root.mdOn ? root.mdHtml(editor.text) : ""
+                        }
                     }
                 }
             }
@@ -489,6 +593,217 @@ Item {
                     color: root.noticeBad ? root.cBad : root.cText
                     wrapMode: Text.Wrap
                     textFormat: Text.PlainText
+                }
+            }
+        }
+
+        // ── message stats (debug): what this device sends, in RLN terms
+        Rectangle { Layout.fillHeight: true; Layout.preferredWidth: 1; color: root.cLine; visible: root.showStats }
+        Rectangle {
+            id: statsPanel
+            visible: root.showStats
+            Layout.fillHeight: true
+            Layout.preferredWidth: 330
+            Layout.minimumWidth: 330
+            Layout.maximumWidth: 330
+            color: root.cSurface
+            readonly property var s: root.stats ? root.stats.stats : null
+            readonly property int budget: root.stats ? root.stats.budget : 100
+            readonly property int used: root.total(s ? s.sent_this_epoch : null)
+
+            ScrollView {
+                anchors.fill: parent
+                anchors.margins: 12
+                clip: true
+                contentWidth: availableWidth
+
+                ColumnLayout {
+                    width: statsPanel.width - 24
+                    spacing: 6
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { Layout.fillWidth: true; text: "Message stats"; color: root.cText; font.pixelSize: 16; font.bold: true; textFormat: Text.PlainText }
+                        Text {
+                            text: "Close"; color: root.cSub; font.pixelSize: 11; font.underline: true; textFormat: Text.PlainText
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.showStats = false }
+                        }
+                    }
+                    RLabel {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        elide: Text.ElideNone
+                        font.pixelSize: 11
+                        text: "Logos Delivery meters what a node publishes (RLN): a membership allows a number of messages per 10-minute epoch, shared by every app on the node. Receiving is free. Notes that aren't open send nothing; the open one announces itself when opened and every 2 minutes, and edits are merged."
+                    }
+                    RLabel { visible: root.statsError !== ""; Layout.fillWidth: true; wrapMode: Text.Wrap; color: root.cBad; text: root.statsError }
+                    RLabel { visible: root.stats !== null && !statsPanel.s; Layout.fillWidth: true; wrapMode: Text.Wrap; text: "No counters yet (the engine is starting)." }
+
+                    // this epoch against the budget
+                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine; visible: !!statsPanel.s }
+                    ColumnLayout {
+                        visible: !!statsPanel.s
+                        Layout.fillWidth: true
+                        spacing: 4
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: "This epoch"; color: root.cText; font.pixelSize: 13; font.bold: true; textFormat: Text.PlainText }
+                            Item { Layout.fillWidth: true }
+                            RLabel {
+                                text: statsPanel.s ? (root.clock(statsPanel.s.epoch_seconds - statsPanel.s.epoch_elapsed) + " left") : ""
+                            }
+                        }
+                        Text {
+                            text: statsPanel.used + " of " + statsPanel.budget + " messages"
+                            color: statsPanel.used * 10 >= statsPanel.budget * 8 ? root.cBad : (statsPanel.used * 2 >= statsPanel.budget ? root.cAccent : root.cText)
+                            font.pixelSize: 22
+                            textFormat: Text.PlainText
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 6
+                            radius: 3
+                            color: root.cBg
+                            Rectangle {
+                                width: parent.width * Math.min(1, statsPanel.used / Math.max(1, statsPanel.budget))
+                                height: parent.height
+                                radius: 3
+                                color: statsPanel.used * 10 >= statsPanel.budget * 8 ? root.cBad : (statsPanel.used * 2 >= statsPanel.budget ? root.cAccent : root.cOk)
+                            }
+                        }
+                        RLabel {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            elide: Text.ElideNone
+                            font.pixelSize: 11
+                            text: root.stats ? ("Budget assumed: " + root.stats.budget + " per epoch (the smallest membership). Edits now go out at most every "
+                                                + root.stats.publishInterval + " s; a snapshot follows " + root.stats.snapshotQuiet + " s after you stop typing.") : ""
+                        }
+                        RLabel {
+                            Layout.fillWidth: true
+                            font.pixelSize: 11
+                            text: statsPanel.s ? ("Last epoch: " + root.total(statsPanel.s.sent_last_epoch) + " messages") : ""
+                        }
+                    }
+
+                    // breakdown
+                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine; visible: !!statsPanel.s }
+                    GridLayout {
+                        visible: !!statsPanel.s
+                        Layout.fillWidth: true
+                        columns: 3
+                        columnSpacing: 10
+                        rowSpacing: 2
+                        RLabel { text: "Sent, by kind"; color: root.cText; font.bold: true; Layout.fillWidth: true }
+                        RLabel { text: "epoch"; horizontalAlignment: Text.AlignRight; Layout.preferredWidth: 50 }
+                        RLabel { text: "total"; horizontalAlignment: Text.AlignRight; Layout.preferredWidth: 50 }
+                        Repeater {
+                            model: [
+                                ["ops", "Edits (merged)"], ["snapshots", "Snapshots"], ["heads", "Catch-up requests"],
+                                ["repairs", "Catch-up answers"], ["presence", "Presence"], ["cursors", "Cursors"], ["relayed", "Relayed (bridge)"]
+                            ]
+                            delegate: RLabel {
+                                required property var modelData
+                                required property int index
+                                Layout.row: index + 1
+                                Layout.column: 0
+                                Layout.fillWidth: true
+                                text: modelData[1]
+                            }
+                        }
+                        Repeater {
+                            model: ["ops", "snapshots", "heads", "repairs", "presence", "cursors", "relayed"]
+                            delegate: RLabel {
+                                required property var modelData
+                                required property int index
+                                Layout.row: index + 1
+                                Layout.column: 1
+                                Layout.preferredWidth: 50
+                                horizontalAlignment: Text.AlignRight
+                                color: root.cText
+                                text: statsPanel.s ? String(statsPanel.s.sent_this_epoch[modelData]) : ""
+                            }
+                        }
+                        Repeater {
+                            model: ["ops", "snapshots", "heads", "repairs", "presence", "cursors", "relayed"]
+                            delegate: RLabel {
+                                required property var modelData
+                                required property int index
+                                Layout.row: index + 1
+                                Layout.column: 2
+                                Layout.preferredWidth: 50
+                                horizontalAlignment: Text.AlignRight
+                                text: statsPanel.s ? String(statsPanel.s.sent[modelData]) : ""
+                            }
+                        }
+                    }
+                    RLabel {
+                        visible: !!statsPanel.s
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        elide: Text.ElideNone
+                        font.pixelSize: 11
+                        text: statsPanel.s ? ("Since start (" + root.clock(statsPanel.s.uptime) + "): sent " + root.total(statsPanel.s.sent) + " (" + root.kb(statsPanel.s.sent.bytes)
+                                              + "), received " + root.total(statsPanel.s.received) + " (" + root.kb(statsPanel.s.received.bytes) + ")") : ""
+                    }
+                    RLabel {
+                        Layout.fillWidth: true
+                        font.pixelSize: 11
+                        text: "Delivery node: " + (root.transport.status || "?") + root.peersText()
+                    }
+
+                    // per note
+                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine; visible: !!statsPanel.s }
+                    Text { visible: !!statsPanel.s; text: "Per note"; color: root.cText; font.pixelSize: 13; font.bold: true; textFormat: Text.PlainText }
+                    Repeater {
+                        model: statsPanel.s ? statsPanel.s.topics : []
+                        delegate: Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: noteCol.implicitHeight + 12
+                            radius: 6
+                            color: modelData.active ? root.cRaised : "transparent"
+                            border.width: 1
+                            border.color: root.cLine
+                            ColumnLayout {
+                                id: noteCol
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 1
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: (root.stats && root.stats.names[modelData.topic]) || modelData.topic.substring(0, 12)
+                                        color: root.cText
+                                        font.pixelSize: 12
+                                        elide: Text.ElideRight
+                                        textFormat: Text.PlainText
+                                    }
+                                    RLabel { text: modelData.active ? "open" : "background"; color: modelData.active ? root.cOk : root.cFaint; font.pixelSize: 10 }
+                                }
+                                RLabel {
+                                    Layout.fillWidth: true
+                                    font.pixelSize: 11
+                                    text: "sent " + root.total(modelData.sent_this_epoch) + " this epoch, " + root.total(modelData.sent) + " total - received " + root.total(modelData.received)
+                                }
+                                RLabel {
+                                    Layout.fillWidth: true
+                                    font.pixelSize: 11
+                                    color: root.cFaint
+                                    wrapMode: Text.Wrap
+                                    elide: Text.ElideNone
+                                    text: {
+                                        var p = modelData.peers || []
+                                        if (p.length === 0) return "no other devices heard from"
+                                        var parts = []
+                                        for (var i = 0; i < p.length && i < 4; i++) parts.push(p[i].key.substring(0, 8) + " " + root.ago(p[i].seconds_ago))
+                                        return p.length + (p.length === 1 ? " device: " : " devices: ") + parts.join(", ") + (p.length > 4 ? ", ..." : "")
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

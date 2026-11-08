@@ -65,6 +65,25 @@ QString FakeCore::callModule(const QString &mod, const QString &method, const QV
         if (merged != sent) d.version++;
         QJsonObject c = detail(arg(0), d); c["editVersion"] = QString::number(ev);
         r["current"] = c;
+    } else if (method == "stats") {
+        auto counts = [](int ops, int snaps, int heads, int rep, int pres) {
+            return QJsonObject{{"ops", ops}, {"snapshots", snaps}, {"heads", heads}, {"repairs", rep}, {"relayed", 0},
+                               {"presence", pres}, {"cursors", 0}, {"bytes", (ops + snaps + heads + rep + pres) * 700}};
+        };
+        QJsonObject names;
+        for (auto it = docs.begin(); it != docs.end(); ++it) names[it.key()] = it->name.isEmpty() ? "Untitled" : it->name;
+        QJsonArray topics;
+        bool first = true;
+        for (auto it = docs.begin(); it != docs.end(); ++it) {
+            topics.append(QJsonObject{{"topic", it.key()}, {"active", first}, {"sent", counts(first ? 31 : 1, first ? 4 : 1, first ? 3 : 0, 1, first ? 6 : 0)},
+                                      {"sent_this_epoch", counts(first ? 31 : 0, first ? 4 : 0, first ? 3 : 0, 1, first ? 6 : 0)}, {"received", counts(12, 2, 3, 0, 8)},
+                                      {"peers", QJsonArray{QJsonObject{{"key", "ab12cd34ef56"}, {"seconds_ago", 4}}}}});
+            first = false;
+        }
+        r["budget"] = 100; r["publishInterval"] = 2; r["snapshotQuiet"] = 10; r["names"] = names;
+        r["stats"] = QJsonObject{{"transport", "logos-delivery"}, {"epoch_seconds", 600}, {"epoch_elapsed", 252}, {"uptime", 1500},
+                                 {"sent", counts(40, 6, 5, 2, 9)}, {"sent_this_epoch", counts(31, 4, 3, 1, 6)}, {"sent_last_epoch", counts(12, 2, 3, 0, 5)},
+                                 {"received", counts(20, 3, 4, 0, 10)}, {"topics", topics}};
     } else if (method == "remove_document") {
         docs.remove(arg(0));
     } else {
@@ -151,6 +170,30 @@ int main(int argc, char **argv) {
         check(js(&view, "currentId").toString().isEmpty(), "remove closes the note");
         check(!core->docs.contains(id), "remove reaches the core");
         grab(&view, out + "/05-removed.png");
+        js(&view, "newTitle.text = '# Plan'; createDoc()");
+    });
+    at(8100, [&] {
+        js(&view, "editor.text = '# Plan\\n\\nSome **bold** and *italic* text, `code`, a [link](https://logos.co) and snake_case_name.\\n\\n## Tasks\\n- [x] done item\\n- [ ] open item with a long line that wraps around the edge of the editor so we can see the overlay wrap in the same place as the editor\\n1. first\\n> a quote with <html> & ampersands\\n\\n```\\nlet x = 1 < 2;\\n```\\n---\\nplain line'");
+    });
+    at(8700, [&] {
+        QString html = js(&view, "mdLayer.text").toString();
+        check(js(&view, "mdLayer.visible").toBool(), "markdown colours are on");
+        check(html.contains("&lt;html&gt; &amp; ampersands"), "markdown layer escapes html");
+        check(!html.contains("snake<"), "snake_case is not emphasis");
+        check(js(&view, "mdLayer.implicitHeight").toDouble() == js(&view, "editor.contentHeight").toDouble(), "markdown layer wraps like the editor");
+        fprintf(stderr, "[heights] layer=%s editor=%s\n", qPrintable(js(&view, "mdLayer.implicitHeight").toString()), qPrintable(js(&view, "editor.contentHeight").toString()));
+        grab(&view, out + "/06-markdown.png");
+        // Alignment check: the editor's own text, in red, over the coloured layer.
+        js(&view, "editor.color = 'red'");
+    });
+    at(9000, [&] {
+        grab(&view, out + "/07-markdown-overlap.png");
+        js(&view, "showStats = true");
+    });
+    at(9600, [&] {
+        check(js(&view, "stats !== null && stats.ok").toBool(), "stats panel loads the core's counters");
+        check(js(&view, "statsPanel.used").toInt() == 45, "stats panel sums this epoch's messages");
+        grab(&view, out + "/08-stats.png");
         fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
         QGuiApplication::exit(failures);
     });

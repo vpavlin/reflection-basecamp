@@ -612455,18 +612455,18 @@
       },
       "locked": {
         "dir": "reflection_core",
-        "lastModified": 1794079328,
-        "narHash": "sha256-0Mm5zpB/nD+rMwymbdCpkNN/0J9wFHtap/YrEqjUM2A=",
+        "lastModified": 1794122683,
+        "narHash": "sha256-twgyFC4ic4NvJE8CWCzJhZhuNRHT9Nn4z9BohnHnFrw=",
         "owner": "vpavlin",
         "repo": "reflection-basecamp",
-        "rev": "a4c510f8801b82f0eb94712315699863815d2ed2",
+        "rev": "70dec39d5665af66067ea3161f8852e819c71d36",
         "type": "github"
       },
       "original": {
         "dir": "reflection_core",
         "owner": "vpavlin",
         "repo": "reflection-basecamp",
-        "rev": "a4c510f8801b82f0eb94712315699863815d2ed2",
+        "rev": "70dec39d5665af66067ea3161f8852e819c71d36",
         "type": "github"
       }
     },
