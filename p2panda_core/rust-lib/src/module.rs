@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::engine::{Emit, Engine, Event, Options, API_VERSION};
 use crate::loam::{self, LoamApi, LoamBus};
-use crate::{loam_core, modules, P2pandaCoreModule, RustModuleContext};
+use crate::{emit_pending, emit_restarted, loam_core, modules, P2pandaCoreModule, RustModuleContext};
 
 /// Module calls made while the host is still setting the module up are refused.
 const STARTUP_DELAY: Duration = Duration::from_millis(1500);
