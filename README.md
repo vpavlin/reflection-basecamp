@@ -29,6 +29,26 @@ and relays the notes it has open in both directions
 Tested headless on the real networks: Basecamp <-> bridge <-> p2panda, live edits in 1-2 s.
 `REFLECTION_BACKEND=logos` instead makes the GTK app a plain Logos peer of this app.
 
+## Messages and RLN
+
+Logos Delivery meters what a node publishes (RLN: a number of messages per 10-minute epoch,
+shared by every app on the node). Receiving is free. So
+([ADR 0008](https://github.com/vpavlin/reflection/blob/feat/logos-delivery/docs/logos/adr/0008-rln-message-budget.md)):
+
+- notes you don't have open publish nothing. They still receive, and still answer other people
+  who open them and ask for missing edits;
+- the open note says hello when you open it, pings every 2 minutes, and asks for missing edits
+  when opened;
+- your typing is merged: at most one message every 2 s (10 s once half of a 100-message
+  budget is used, 30 s past 80 %), and one snapshot 10 s after you stop.
+
+**Message stats** (bottom of the sidebar) shows what this device sent this epoch against the
+budget, by kind, and per note. It is a debug tool: set `debugTools` to `false` in
+`reflection/Main.qml` for a build without it.
+
+The editor colours Markdown syntax (headings, emphasis, code, links, lists, quotes). The text
+itself stays plain, as in the GTK app.
+
 ## Building
 
 ```sh
