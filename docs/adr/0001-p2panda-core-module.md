@@ -81,16 +81,23 @@ standard base64. `network` is the 32-byte network id (hex), `topic` the 32-byte 
 | `status()` | Per network: node up, iroh relay/direct connections, peers per topic, sync sessions. |
 | `stats()` | Operations sent/received per topic; for bridged topics, Logos messages by kind per RLN epoch (as `TransportStats` in the fork). |
 
-Events (one module event each, payload JSON):
+Incoming data is not pushed as events (see section 6: events reach every module). It waits in a
+per-app queue, which the app drains:
+
+| Method | Does |
+|---|---|
+| `drain(app, max)` | The oldest `max` items (at most 256, or 1 MiB) of this app's queue, removed from it. Items: `{"kind": "operation", network, topic, author, seq, hash, prune, header_b64, body_b64, source}` (`source`: `"local"`, `"p2panda"`, `"logos"`), `{"kind": "ephemeral", network, topic, author, timestamp, body_b64}`, `{"kind": "sync", network, topic, remote, state}`. |
+| `api_version()` | The API version, so an app can tell an older or newer module apart. |
+
+Events carry no content:
 
 | Event | Payload |
 |---|---|
-| `operation` | `app, network, topic, author, seq, hash, prune, header_b64, body_b64, source` (`"local"`, `"p2panda"`, `"logos"`) |
-| `ephemeral` | `app, network, topic, author, timestamp, body_b64` |
-| `sync` | `network, topic, remote, state` (`started` / `ended` / `failed`, with error) |
+| `pending` | `app, count`: this app's queue has items (sent when it goes from empty to non-empty, and at most once a second while it stays so). |
+| `restarted` | `api_version`: the module started; apps `open` their topics again (`open` is idempotent). |
 
-Replays over IPC go in order and in batches of at most 256 events or 1 MiB, so opening a long
-topic does not flood the host.
+A replay (`open` with `from = "start"`) fills the app's queue in order, batch by batch, as the app
+drains it.
 
 ### 4. The bridge lives in `p2panda_core`
 
@@ -132,6 +139,30 @@ syncs over one of:
 The choice is a setting in the view, per device first. Switching restarts the engine's node; the
 documents stay (their operations are re-imported on the other side on first open).
 
+### 6. One module for every app
+
+Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So:
+
+- **Isolation.** Basecamp module events reach every module that listens, so data never travels in
+  events: each app drains its own queue (section 3). On p2panda, operation bodies are not
+  encrypted per app (Reflection's are plain Loro updates), so broadcasting them would hand every
+  app's content to every other module, and make every app decode everyone's traffic.
+- **Fairness.** Each app's queue is bounded (default 4096 items or 16 MiB). A full queue pauses
+  that app's replay and its live delivery for that app (they resume as it drains; live
+  operations are still stored and synced, the app reads them later from the store), and nothing
+  else. Replays of different apps are filled round-robin.
+- **Failure isolation.** Every call is guarded (`catch_unwind`, typed JSON reads, size limits): a
+  bad request or operation from one app fails that call only.
+- **Shared node, separate subscriptions.** Apps on the same network id share its node and store;
+  each app only receives topics it opened. An app that knows another app's topic id can open it,
+  as anyone on the network can: topic ids are the secret.
+- **Restarts and upgrades are for everyone.** The module announces `restarted`; apps open again.
+  `api_version` lets an app refuse or adapt to a module it doesn't support.
+- **Trust boundary.** All Basecamp modules run as the user, and `app` is a label the caller
+  passes, so a hostile module on the device could drain another app's queue. Per-app queues stop
+  accidental leaks and cross-traffic, not a malicious module on the user's own machine; apps
+  that need more encrypt their bodies.
+
 ## Alternatives considered
 
 - **Bridge inside `reflection_core`** (`Node::with_bridge` on `loam_core`'s bus). Smallest change,
@@ -160,8 +191,9 @@ documents stay (their operations are re-imported on the other side on first open
    signed, or pass their key with each write and the module forgets it.
 2. **One module, one node per network id inside it** (section 1). Users see no difference; one
    module is simpler to run and to show status for.
-3. **Replay is pushed as events, in batches** (section 3), not pulled in pages: it matches how
-   `reflection-node` already consumes p2panda streams.
+3. **Replay and live data reach each app through its own queue** (sections 3 and 6). The owner
+   first chose pushed events; since one module serves every app and Basecamp events reach every
+   module, data goes into per-app queues the app drains, and events only say "you have items".
 4. **The bridge is the user's**: a p2panda view lists bridged topics with on/off switches; apps
    may turn bridging on only from a user action in their own UI (section 4).
 5. **Ship on the patched p2panda** (vpavlin/p2panda `live-push-imports`), and keep offering the
