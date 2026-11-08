@@ -1,6 +1,6 @@
 # ADR 0001: `p2panda_core`, a shared p2panda node for Basecamp apps
 
-Status: proposed (2026-11-08). Owner decisions recorded, design review (laptop/reviewer,
+Status: accepted (2026-11-08). Owner decisions recorded, design review (laptop/reviewer,
 2026-11-08) taken in; see "Review" at the end for what changed.
 
 ## Context
@@ -310,6 +310,20 @@ two apps on one topic and network each get every operation; an app that crashes 
 active stops costing after its lease; a restart resumes from a cursor without applying anything
 twice; a packet capture of discovery and gossip for one topic shows no plain topic id to peers
 that don't share it.
+
+## Further decisions (owner, 2026-11-08)
+
+- **Licence.** The Logos protocol and the bridge move out of the GPL `reflection-node` into their
+  own crate under MIT OR Apache-2.0 (we wrote all of it), used by both the fork and this module,
+  so `p2panda_core` can serve apps under any licence.
+- **Name** stays `p2panda_core` for now; no announcement to the p2panda team yet.
+- **Scope of the first build:** Reflection and the bridge only. A second app to prove the API is
+  general comes later.
+- **Order:** this module before Logos Storage snapshots.
+- **Where:** in `reflection-basecamp` for now, next to `reflection_core`.
+- **Reflection's keys:** `reflection_core` signs its own operations and `import`s them, so the
+  user's identity key never leaves it; one identity per device, as in the GTK app. Per-document
+  keys only matter for apps that sign through a module session.
 
 ## Review (laptop/reviewer, 2026-11-08)
 
