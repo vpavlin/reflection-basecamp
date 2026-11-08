@@ -1,7 +1,7 @@
 # ADR 0001: `p2panda_core`, a shared p2panda node for Basecamp apps
 
-Status: proposed (2026-11-08), for review. Owner decisions on the open questions recorded
-2026-11-08 (section "Decisions on the open questions").
+Status: proposed (2026-11-08). Owner decisions recorded, design review (laptop/reviewer,
+2026-11-08) taken in; see "Review" at the end for what changed.
 
 ## Context
 
@@ -43,9 +43,10 @@ device, and can bridge any of its topics to Logos Delivery through `loam_core`.
 ### 1. One module, one node per network id
 
 Each p2panda app has its own network id (Reflection: `blake3("reflection-v2")`). The module runs
-one `p2panda::Node` per network id in use, created on the first `open` for it and sharing one
-iroh configuration (relay, bootstrap, mDNS) and one SQLite store per network id under the
-module's data directory. Apps never see iroh or the store.
+one `p2panda::Node` per network id in use, created on the first `open` for it, with the same iroh
+configuration (relay, bootstrap, mDNS) but **its own iroh node key and its own SQLite store** per
+network id, under the module's data directory. Separate node keys stop p2panda peers from linking
+one device across unrelated apps. Apps never see iroh or the store.
 
 ### 2. Identity: apps control their keys
 
@@ -59,6 +60,17 @@ The module never creates, stores or chooses a signing key. Two ways to write:
   with that key, ingests it and forgets the key. For apps that don't want p2panda's encoding in
   their own code. The key crosses Basecamp IPC on the device, as the app's other data does.
 
+`import` is the recommended path; `publish(key)` is the convenience path, because a private key
+crossing IPC on every write is exposed to logs, crash dumps and tools like `logosctl watch`. The
+module never logs method arguments (keys, bodies, topic ids), keeps keys out of error messages,
+and zeroizes a key once the operation is signed.
+
+For `import`, the app needs to know where its log stands: `head` gives the latest operation of an
+author's log as the module has it (after a restart, or when the same key also wrote through
+`publish` or from another device). The module serializes writes per `(network, topic, author)`,
+so a `publish` and an `import` with one key can't fork a log; an `import` that doesn't fit the
+head is refused with the head in the error.
+
 Where an app keeps its key, and whether it is one key per device, per network or per document, is
 the app's decision. `app` stays a label (for status, stats and the bridge view), not a credential.
 
@@ -70,14 +82,17 @@ standard base64. `network` is the 32-byte network id (hex), `topic` the 32-byte 
 
 | Method | Does |
 |---|---|
-| `open(app, network, topic, from, label)` | Subscribe to a topic. `from`: `"start"` replays every stored operation as events first, then live; `"live"` only new ones. Idempotent per `(app, topic)`. `label` is what the p2panda view shows for the topic (e.g. the note's name); it can be changed with another `open`. |
-| `close(app, network, topic)` | Stop delivering events for it to this app (the node leaves the topic when no app has it open). |
+| `open(app, network, topic, from, label)` | Subscribe to a topic. `from`: `"start"` queues every stored operation, then live ones; `"live"` only new ones; or a **cursor** from an earlier `drain`, to resume after it. Idempotent per `(app, network, topic)`. `label` is what the p2panda view shows for the topic (e.g. the note's name). |
+| `close(app, network, topic)` | Stop delivering it to this app and drop this app's queued items for it; clears this app's `set_active`. The node leaves the topic when no app has it open. |
+| `forget(app, network, topic)` | The user deleted the document: close it, delete its stored operations and its bridge state. Refused while another app has it open. |
+| `head(network, topic, author)` | The latest operation (seq, hash) of an author's log, or none. |
+| `heads(network, topic)` | The same for every author of the topic. |
 | `publish(app, network, topic, key, body_b64)` | Append an operation with this body to the log of `key`'s author, signed with `key` (not kept). Returns the operation hash and seq. |
 | `prune(app, network, topic, key, body_b64)` | The same with the prune flag (a snapshot; earlier operations of that log may be deleted everywhere). |
 | `import(app, network, topic, header_b64, body_b64)` | Ingest an operation the app signed. Refused if invalid or not for this topic's log. |
 | `ephemeral(app, network, topic, key, body_b64)` | Send an ephemeral message (presence, cursors), signed with `key` (not kept). |
-| `set_active(app, network, topic, active)` | Whether the user has the topic open (used by the bridge, section 4). |
-| `bridge(app, network, topic, on)` | Carry this topic over Logos Delivery as well (section 4). Only in response to a user action in the app; the user sees and can undo it in the p2panda view. |
+| `set_active(app, network, topic, active)` | Whether the user has the topic open (used by the bridge, section 4). A **lease**: it expires after 60 s unless renewed, so a crashed app can't leave a topic active. A topic is active while any app holds a lease on it. |
+| `bridge(app, network, topic, on)` | `on`: **ask** to carry this topic over Logos Delivery as well; it stays `pending` until the user confirms it in the p2panda view (section 4). `off`: stop bridging, at once. |
 | `status()` | Per network: node up, iroh relay/direct connections, peers per topic, sync sessions. |
 | `stats()` | Operations sent/received per topic; for bridged topics, Logos messages by kind per RLN epoch (as `TransportStats` in the fork). |
 
@@ -86,7 +101,7 @@ per-app queue, which the app drains:
 
 | Method | Does |
 |---|---|
-| `drain(app, max)` | The oldest `max` items (at most 256, or 1 MiB) of this app's queue, removed from it. Items: `{"kind": "operation", network, topic, author, seq, hash, prune, header_b64, body_b64, source}` (`source`: `"local"`, `"p2panda"`, `"logos"`), `{"kind": "ephemeral", network, topic, author, timestamp, body_b64}`, `{"kind": "sync", network, topic, remote, state}`. |
+| `drain(app, max)` | The oldest items of this app's queue, removed from it: at most `max` (≤ 256) and about 1 MiB, but **always at least one**, however large, so a big snapshot can't wedge the queue. Items: `{"kind": "operation", network, topic, author, seq, hash, prune, header_b64, body_b64, source, cursor}` (`source`: `"local"`, `"p2panda"`, `"logos"`), `{"kind": "ephemeral", network, topic, author, timestamp, body_b64}`, `{"kind": "sync", network, topic, remote, state}`. |
 | `api_version()` | The API version, so an app can tell an older or newer module apart. |
 
 Events carry no content:
@@ -96,8 +111,16 @@ Events carry no content:
 | `pending` | `app, count`: this app's queue has items (sent when it goes from empty to non-empty, and at most once a second while it stays so). |
 | `restarted` | `api_version`: the module started; apps `open` their topics again (`open` is idempotent). |
 
-A replay (`open` with `from = "start"`) fills the app's queue in order, batch by batch, as the app
-drains it.
+A replay (`open` with `from = "start"` or a cursor) fills the app's queue in order, batch by batch,
+as the app drains it.
+
+**Delivery guarantee:** at least once, in order within each author's log; an app deduplicates by
+`hash`. The `cursor` of an operation item (the topic's per-author frontier up to and including it)
+is what the app stores to resume after a restart of either side or after its queue overflowed,
+instead of replaying from the start.
+
+The practical payload size of a Basecamp IPC call (Qt Remote Objects) gets measured before the
+drain limits are fixed; the numbers above are a starting point.
 
 ### 4. The bridge lives in `p2panda_core`
 
@@ -113,10 +136,39 @@ The bridge logic is the fork's `BridgeBackend`, unchanged:
 
 Bridging spends the device's Logos (RLN) budget, so the user is in charge of it. `p2panda_core`
 gets a small view of its own, a "p2panda" app in Basecamp (as Loam has for Logos), with the
-network status and the list of bridged topics, each with its app, label and an on/off switch. An
-app may switch a topic on (`bridge`) only as the direct result of a user action in its own UI,
-such as Reflection's per-note "Bridge to p2panda" switch; the p2panda view always shows it and
-can turn it off. Nothing is bridged by default.
+network status and the list of bridged topics, each with its app, label, spend and an on/off
+switch. Because the module can't tell which app calls it, an app can't switch bridging on by
+itself: `bridge(on)` from an app (for example from Reflection's per-note "Bridge to p2panda"
+switch) only puts the topic in **pending**, and it is bridged once the user confirms it in the
+p2panda view. Turning it off needs no confirmation. Nothing is bridged by default. Each app also
+has a cap on how many topics it may have bridged (default 20).
+
+What bridging exposes on the p2panda side (checked in p2panda 0.7 source, vpavlin/p2panda
+dbbecdc): topic discovery is a private set intersection (`p2panda-discovery/src/psi_hash.rs`):
+peers exchange topic ids hashed with a salt both sides contribute per session, so a peer learns
+only the topics it already knows, nothing about the others. Gossip (iroh-gossip) uses the raw
+topic id as its topic, but joins only nodes the address book lists for that topic, i.e. peers
+that proved through discovery that they know it, and over encrypted QUIC connections; iroh relay
+servers see ciphertext. So bridging does not leak the topic id (the document secret) to anyone
+who doesn't already have it. What it does reveal: that this device takes part in p2panda, its
+IP address to the peers it syncs with, and to those peers which of their topics it shares. The
+bridge switch says so.
+
+**Remote peers must not be able to spend the user's budget.** On Logos, anyone with the topic id
+can send `heads`, and each one can make this device re-send logs (repairs), paid from the user's
+membership; an old `heads` frame can also be replayed. So on bridged topics (and in the fork's
+Logos backend generally) repairs are capped: at most one answered `heads` per `(topic, sender)`
+per 30 s, at most 20 repair messages per topic per epoch, repairs sent as the snapshot plus what
+follows rather than whole logs, and the rest counted as `repairs_blocked` in `stats`.
+
+Operations over the Logos size limit (140 KiB) can't be bridged; `publish`/`import` on a bridged
+topic says so in its reply, and the view and `stats` show "not bridged: too large".
+
+**One budget for the device.** `reflection_core` (on Logos directly) and this bridge spend the same
+`loam_core` membership. Counting per module would let each believe it has the whole budget, so the
+budget (real, and the pretend one for trying out tiers) and the spend counter move into
+`loam_core`, which every module asks before publishing. Until `loam_core` has that, the bridge
+reads the pretend budget from its own settings and the view says it isn't shared.
 
 The RLN rules of the fork apply to the Logos side: nothing is published for a bridged topic no app
 has active (`set_active`), except answers to other peers' catch-up requests, and the pretend
@@ -153,6 +205,11 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
   else. Replays of different apps are filled round-robin.
 - **Failure isolation.** Every call is guarded (`catch_unwind`, typed JSON reads, size limits): a
   bad request or operation from one app fails that call only.
+- **Several instances of one app** (a view and a core, two views) must pass distinct `app` labels
+  (for example `reflection/core`), or they share one queue and take each other's items.
+- **Per-app limits:** topics open (default 200), bridged topics (20), queue size (above).
+- **`pending` is broadcast** with the app label and a count: other modules can see that an app has
+  traffic, not what. Apps drain until the queue is empty, not once per event.
 - **Shared node, separate subscriptions.** Apps on the same network id share its node and store;
   each app only receives topics it opened. An app that knows another app's topic id can open it,
   as anyone on the network can: topic ids are the secret.
@@ -196,8 +253,10 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
    module, data goes into per-app queues the app drains, and events only say "you have items".
 4. **The bridge is the user's**: a p2panda view lists bridged topics with on/off switches; apps
    may turn bridging on only from a user action in their own UI (section 4).
-5. **Ship on the patched p2panda** (vpavlin/p2panda `live-push-imports`), and keep offering the
-   patch upstream.
+5. **Ship on the patched p2panda** (vpavlin/p2panda `live-push-imports`), pinned by commit, with
+   `bridge_pushes_logos_edits_to_live_p2panda_peers` in CI as its guard and one explicit test
+   against upstream GTK Reflection (the patch changes only local push behaviour, so the wire
+   stays compatible). Keep offering the patch upstream.
 
 ## Plan
 
@@ -208,3 +267,21 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
    Basecamp Reflection on Logos and upstream GTK Reflection on p2panda.
 4. `P2pandaBus` in the fork and `reflection_core` on it, with the sync-mode setting in the view.
 5. linux-amd64 + linux-arm64 builds, lan03.
+
+Tests, besides the functional ones: a `heads` flood or replay against a bridged topic stays within
+the repair cap; an oversized operation on a bridged topic is reported, not silently p2panda-only;
+two apps on one topic and network each get every operation; an app that crashes with a topic
+active stops costing after its lease; a restart resumes from a cursor without applying anything
+twice; a packet capture of discovery and gossip for one topic shows no plain topic id to peers
+that don't share it.
+
+## Review (laptop/reviewer, 2026-11-08)
+
+Taken in: repair cap against remote budget draining; bridge requests confirmed in the p2panda
+view; `head`/`heads` and per-author write serialization for `import`; cursors and an
+at-least-once guarantee instead of full replays; keys by `(app, network, topic)`; the at-least-one
+rule for `drain`; distinct labels per app instance; `forget`; `set_active` leases; `pending`
+metadata stated; size check for bridged topics; no logging of arguments and key zeroizing;
+`import` as the recommended path; an iroh key per network id; one device-wide budget in
+`loam_core`; the patch pinned and guarded; the extra tests. The question whether discovery leaks
+topic ids was answered from p2panda's source (section 4): it doesn't.
