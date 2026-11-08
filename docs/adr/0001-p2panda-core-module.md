@@ -1,6 +1,7 @@
 # ADR 0001: `p2panda_core`, a shared p2panda node for Basecamp apps
 
-Status: proposed (2026-11-08), for review
+Status: proposed (2026-11-08), for review. Owner decisions on the open questions recorded
+2026-11-08 (section "Decisions on the open questions").
 
 ## Context
 
@@ -46,21 +47,20 @@ one `p2panda::Node` per network id in use, created on the first `open` for it an
 iroh configuration (relay, bootstrap, mDNS) and one SQLite store per network id under the
 module's data directory. Apps never see iroh or the store.
 
-### 2. Identity: apps sign, or the module signs for them
+### 2. Identity: apps control their keys
 
-Two ways to write, both supported:
+The module never creates, stores or chooses a signing key. Two ways to write:
 
 - **App-signed** (`import`): the app builds and signs the p2panda operation itself and hands the
   module the header and body. The module validates and ingests it (`StreamPublisher::import`) and
-  syncs it. The module never holds the app's key. For apps that link `p2panda-core` (Rust).
-- **Module-signed** (`publish`, `prune`): the module signs with a key it keeps per
-  `(app, network id)`, created on first use and stored in the module's data directory. For QML or
-  C++ apps.
+  syncs it. For apps that link `p2panda-core`.
+- **Signed with the app's key** (`publish`, `prune`, `ephemeral`): the app passes its signing key
+  (hex) with the call; the module builds the operation (log, seq, backlink, prune flag), signs it
+  with that key, ingests it and forgets the key. For apps that don't want p2panda's encoding in
+  their own code. The key crosses Basecamp IPC on the device, as the app's other data does.
 
-`app` is a name the caller passes. Basecamp cannot authenticate callers, so any module on the
-device could use any app's module-held key. That is the same trust as everything else in one
-Basecamp (all modules run with the user's rights), and it is stated, not solved: an app that needs
-more signs its own operations.
+Where an app keeps its key, and whether it is one key per device, per network or per document, is
+the app's decision. `app` stays a label (for status, stats and the bridge view), not a credential.
 
 ### 3. API
 
@@ -70,14 +70,14 @@ standard base64. `network` is the 32-byte network id (hex), `topic` the 32-byte 
 
 | Method | Does |
 |---|---|
-| `open(app, network, topic, from)` | Subscribe to a topic. `from`: `"start"` replays every stored operation as events first, then live; `"live"` only new ones. Idempotent per `(app, topic)`. Returns this app's author key on that network. |
+| `open(app, network, topic, from, label)` | Subscribe to a topic. `from`: `"start"` replays every stored operation as events first, then live; `"live"` only new ones. Idempotent per `(app, topic)`. `label` is what the p2panda view shows for the topic (e.g. the note's name); it can be changed with another `open`. |
 | `close(app, network, topic)` | Stop delivering events for it to this app (the node leaves the topic when no app has it open). |
-| `publish(app, network, topic, body_b64)` | Append an operation with this body to the app's log, signed with its module-held key. Returns the operation hash and seq. |
-| `prune(app, network, topic, body_b64)` | The same with the prune flag (a snapshot; earlier operations of that log may be deleted everywhere). |
+| `publish(app, network, topic, key, body_b64)` | Append an operation with this body to the log of `key`'s author, signed with `key` (not kept). Returns the operation hash and seq. |
+| `prune(app, network, topic, key, body_b64)` | The same with the prune flag (a snapshot; earlier operations of that log may be deleted everywhere). |
 | `import(app, network, topic, header_b64, body_b64)` | Ingest an operation the app signed. Refused if invalid or not for this topic's log. |
-| `ephemeral(app, network, topic, body_b64)` | Send an ephemeral message (presence, cursors), signed with the module-held key. |
+| `ephemeral(app, network, topic, key, body_b64)` | Send an ephemeral message (presence, cursors), signed with `key` (not kept). |
 | `set_active(app, network, topic, active)` | Whether the user has the topic open (used by the bridge, section 4). |
-| `bridge(network, topic, on)` | Carry this topic over Logos Delivery as well (section 4). |
+| `bridge(app, network, topic, on)` | Carry this topic over Logos Delivery as well (section 4). Only in response to a user action in the app; the user sees and can undo it in the p2panda view. |
 | `status()` | Per network: node up, iroh relay/direct connections, peers per topic, sync sessions. |
 | `stats()` | Operations sent/received per topic; for bridged topics, Logos messages by kind per RLN epoch (as `TransportStats` in the fork). |
 
@@ -103,6 +103,13 @@ The bridge logic is the fork's `BridgeBackend`, unchanged:
   the newest snapshot plus what follows it (fork ADR 0008);
 - operations from Logos are imported into p2panda and synced on to iroh peers;
 - ephemeral messages are not bridged (they are signed per network).
+
+Bridging spends the device's Logos (RLN) budget, so the user is in charge of it. `p2panda_core`
+gets a small view of its own, a "p2panda" app in Basecamp (as Loam has for Logos), with the
+network status and the list of bridged topics, each with its app, label and an on/off switch. An
+app may switch a topic on (`bridge`) only as the direct result of a user action in its own UI,
+such as Reflection's per-note "Bridge to p2panda" switch; the p2panda view always shows it and
+can turn it off. Nothing is bridged by default.
 
 The RLN rules of the fork apply to the Logos side: nothing is published for a bridged topic no app
 has active (`set_active`), except answers to other peers' catch-up requests, and the pretend
@@ -147,24 +154,25 @@ documents stay (their operations are re-imported on the other side on first open
   stay on Logos only.
 - Mobile is out of scope: Basecamp modules are desktop.
 
-## Open questions for review
+## Decisions on the open questions (owner, 2026-11-08)
 
-1. Module-held keys keyed by a caller-supplied `app` name: acceptable, or should module-signed
-   writes require a per-app secret handed out on first `open`?
-2. One node per network id inside one module, or one module instance per network id?
-3. Is `open(from="start")` replay over events the right shape, or should apps pull pages
-   (`read(topic, after_seq, limit)`) instead?
-4. Should the bridge be controlled by apps (`bridge` method) or only by the user (a setting in a
-   `p2panda_core` view), since it spends the device's RLN budget?
-5. The bridge needs patched p2panda (`live-push-imports`). Ship the module on the patch, or wait
-   for it upstream?
+1. **Keys: apps control them.** No module-held keys (section 2): apps import operations they
+   signed, or pass their key with each write and the module forgets it.
+2. **One module, one node per network id inside it** (section 1). Users see no difference; one
+   module is simpler to run and to show status for.
+3. **Replay is pushed as events, in batches** (section 3), not pulled in pages: it matches how
+   `reflection-node` already consumes p2panda streams.
+4. **The bridge is the user's**: a p2panda view lists bridged topics with on/off switches; apps
+   may turn bridging on only from a user action in their own UI (section 4).
+5. **Ship on the patched p2panda** (vpavlin/p2panda `live-push-imports`), and keep offering the
+   patch upstream.
 
 ## Plan
 
 1. This ADR, reviewed.
 2. `p2panda_core`: node per network id, `open/close/publish/prune/import/ephemeral`, events,
    `status`; two-device test over iroh with `logosctl`.
-3. Bridge in the module (`bridge`, `set_active`, `stats`), tested against Basecamp Reflection on
-   Logos and upstream GTK Reflection on p2panda.
+3. Bridge in the module (`bridge`, `set_active`, `stats`) and the p2panda view, tested against
+   Basecamp Reflection on Logos and upstream GTK Reflection on p2panda.
 4. `P2pandaBus` in the fork and `reflection_core` on it, with the sync-mode setting in the view.
 5. linux-amd64 + linux-arm64 builds, lan03.
