@@ -30,7 +30,7 @@ Item {
     readonly property color cCode: tok(pal.success, "#7fc79a")
     readonly property color cLink: "#8ab4f8"
     readonly property color cEmph: "#e9b97a"
-    readonly property string viewVersion: "0.3.0"
+    readonly property string viewVersion: "0.4.0"
 
     // Build switches. `debugTools` shows the message-stats button (how many Logos messages this
     // device sends, mapped to the RLN budget); set it to false for a build without it.
@@ -303,6 +303,7 @@ Item {
             if (!r.ok) { root.say(r.error || "Could not change the setting", true); return }
             root.settingsSeq++
             root.st = Object.assign({}, root.st, { settings: r.settings })
+            if (r.restartRequired) root.say("Saved. Restart Basecamp to switch the sync network.")
             if (done) done()
             if (root.showStats) root.refreshStats()
         })
@@ -387,6 +388,45 @@ Item {
         selectByMouse: true
         background: Rectangle { radius: 6; color: root.cBg; border.width: 1; border.color: parent.activeFocus ? root.cAccent : root.cLine }
     }
+    // A pill-shaped switch.
+    component RToggle: Rectangle {
+        id: toggle
+        property bool on: false
+        property string label: ""
+        signal toggled()
+        Layout.preferredHeight: 34
+        Layout.preferredWidth: toggleRow.implicitWidth + 20
+        radius: 17
+        color: toggleHover.containsMouse ? root.cRaised : "transparent"
+        border.width: 1
+        border.color: toggle.on ? root.cAccent : root.cLine
+        RowLayout {
+            id: toggleRow
+            anchors.centerIn: parent
+            spacing: 6
+            Rectangle {
+                width: 28; height: 16; radius: 8
+                color: toggle.on ? root.cAccent : root.cBg
+                border.width: 1; border.color: root.cLine
+                Rectangle { width: 12; height: 12; radius: 6; y: 2; x: toggle.on ? 14 : 2; color: root.cText }
+            }
+            Text { text: toggle.label; color: root.cText; font.pixelSize: 12; textFormat: Text.PlainText }
+        }
+        MouseArea { id: toggleHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: toggle.toggled() }
+    }
+
+    readonly property bool p2pandaMode: st.syncMode === "p2panda"
+    readonly property string bridgeState: (root.current && root.current.bridge) ? root.current.bridge : "off"
+    function toggleBridge() {
+        var on = root.bridgeState === "off"
+        root.core("bridge_note", [root.currentId, on ? "true" : "false"], function (raw) {
+            var r = root.parse(raw)
+            if (!r || !r.ok) { root.say((r && r.error) || "Could not change bridging", true); return }
+            root.say(on ? "Asked to bridge this note to Logos. Approve it in the p2panda app." : "This note is no longer bridged to Logos.")
+            root.refresh()
+        })
+    }
+
     component RLabel: Text { color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText; elide: Text.ElideRight }
 
     Rectangle { anchors.fill: parent; color: root.cBg }
@@ -578,6 +618,12 @@ Item {
                         cursorShape: Qt.PointingHandCursor
                         onClicked: root.setSettings({ shareCursor: !root.settings.shareCursor }, function () { cursorDebounce.restart() })
                     }
+                }
+                RToggle {
+                    visible: root.p2pandaMode
+                    on: root.bridgeState !== "off"
+                    label: root.bridgeState === "pending" ? "Also on Logos (approve in p2panda)" : "Also on Logos"
+                    onToggled: root.toggleBridge()
                 }
                 LogosButton { text: "Copy id"; Layout.preferredWidth: 96; Layout.preferredHeight: 34; onClicked: root.copy(root.currentId) }
                 LogosButton { text: root.confirmRemove ? "Really remove?" : "Remove"; Layout.preferredWidth: 120; Layout.preferredHeight: 34; onClicked: root.removeDoc() }
@@ -847,6 +893,38 @@ Item {
                             font.pixelSize: 10
                             color: root.cFaint
                             text: "Not enforced by the network yet. Past the limit nothing more is sent this epoch (as RLN would drop it); edits slow down from half of it. Empty: no limit."
+                        }
+
+                        // which network Reflection syncs over
+                        RLabel { Layout.fillWidth: true; Layout.topMargin: 8; text: "Sync network"; color: root.cText }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            Repeater {
+                                model: [["logos", "Logos Delivery"], ["p2panda", "p2panda"]]
+                                delegate: LogosButton {
+                                    required property var modelData
+                                    text: (((root.settings.syncMode || "logos") === modelData[0]) ? "● " : "") + modelData[1]
+                                    Layout.preferredHeight: 30
+                                    enabled: modelData[0] !== "p2panda" || !!root.st.p2pandaAvailable
+                                    onClicked: root.setSettings({ syncMode: modelData[0] })
+                                }
+                            }
+                        }
+                        RLabel {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            elide: Text.ElideNone
+                            font.pixelSize: 10
+                            color: root.cFaint
+                            text: {
+                                var running = root.st.syncMode || "logos"
+                                var chosen = root.settings.syncMode || "logos"
+                                var t = "Running on " + (running === "p2panda" ? "p2panda (the network of upstream Reflection)" : "Logos Delivery") + "."
+                                if (chosen !== running) t += " Restart Basecamp to switch to " + (chosen === "p2panda" ? "p2panda" : "Logos Delivery") + "."
+                                if (running === "p2panda") t += " On p2panda, a note reaches Logos users only if you bridge it (the switch on the note) and approve it in the p2panda app; the bridge spends this device's Logos messages."
+                                return t
+                            }
                         }
                     }
 

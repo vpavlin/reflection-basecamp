@@ -45,6 +45,21 @@ QString FakeCore::callModule(const QString &mod, const QString &method, const QV
     QVariantList a = v.toList();
     auto arg = [&](int i) { return i < a.size() ? a[i].toString() : QString(); };
     QJsonObject r{{"ok", true}};
+    if (mod == "p2panda_core") {
+        // Enough of p2panda_core for its view (p2panda_ui/Main.qml).
+        QString net = "d993c823dc344bd50c7bb24037071b54d0e0575ade66059550ca3bd5a6554681";
+        if (method == "status")
+            return QJsonDocument(QJsonObject{{"ok", true}, {"apiVersion", 1},
+                {"networks", QJsonArray{QJsonObject{{"network", net}, {"app", "reflection"}, {"author", "1a94a5ea6f111277577b20efdacc5129fe93450daec6500a63f3df0469d0dea5"}, {"bridged", 1},
+                    {"logos", QJsonObject{{"sent_this_epoch", QJsonObject{{"relayed", 4}, {"heads", 1}}}}}}}},
+                {"subscriptions", QJsonArray{QJsonObject{{"network", net}}, QJsonObject{{"network", net}}}}}).toJson(QJsonDocument::Compact);
+        if (method == "bridges")
+            return QJsonDocument(QJsonObject{{"ok", true}, {"bridges", QJsonArray{
+                QJsonObject{{"network", net}, {"topic", "b6505f981ea7a14a16e7ca747cc78814a9064a9e7425f88d2bddb2ffe5378c16"}, {"app", "reflection"}, {"label", "Plan for May"}, {"state", "pending"}},
+                QJsonObject{{"network", net}, {"topic", "2729ea81e63ec653644a541863725571d63667695c4ab19941dc749681ccaa0c"}, {"app", "reflection"}, {"label", "Shopping"}, {"state", "on"}}}}}).toJson(QJsonDocument::Compact);
+        if (method == "bridge_confirm") return QJsonDocument(QJsonObject{{"ok", true}}).toJson(QJsonDocument::Compact);
+        return "";
+    }
     if (mod != "reflection_core") return "";
     if (method == "state") {
         QJsonArray list;

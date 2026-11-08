@@ -7,6 +7,9 @@
     # loam_core 0.7.3 (vpavlin/loam-basecamp feat/relay-default): only its contract is used here.
     loam_core.url = "github:vpavlin/loam-basecamp/d5c72af7e07490079f26a41ac606b27cc4d6da2a?dir=core";
     loam_core.inputs.logos-module-builder.follows = "logos-module-builder";
+    # p2panda_core (this repo): the host's shared p2panda node; only its contract is used here.
+    p2panda_core.url = "github:vpavlin/reflection-basecamp/7ccf2ac3b4a9c28fc4d45a8dab7fc2b69d059fd0?dir=p2panda_core";
+    p2panda_core.inputs.logos-module-builder.follows = "logos-module-builder";
   };
 
   outputs = inputs@{ logos-module-builder, ... }:

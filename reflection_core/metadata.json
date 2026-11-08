@@ -1,13 +1,13 @@
 {
   "name": "reflection_core",
   "display_name": "Reflection Core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "core",
   "interface": "cdylib",
   "category": "productivity",
-  "description": "Engine of Reflection notes for Basecamp: p2panda Reflection documents (Loro text) synced over Logos Delivery through loam_core.",
+  "description": "Engine of Reflection notes for Basecamp: p2panda Reflection documents (Loro text) synced over Logos Delivery through loam_core, or over p2panda through p2panda_core (bridged to Logos per note).",
   "main": "reflection_core_plugin",
-  "dependencies": ["loam_core"],
+  "dependencies": ["loam_core", "p2panda_core"],
 
   "codegen": {
     "rust": { "crate": "rust-lib", "trait": "ReflectionCoreModule" }

@@ -16,7 +16,7 @@
 //! Threading: every public method is called on the host's module thread and returns quickly.
 //! Anything that touches the network or the database runs on the engine's own tokio runtime.
 //! Nothing here waits for the transport, which itself waits for the module thread (Logos IPC).
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -25,6 +25,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use loro::{ExportMode, Frontiers, LoroDoc, UpdateOptions, VersionVector};
 use p2panda::{Hash, SigningKey, Topic, VerifyingKey};
 use reflection_node::logos::DeliveryBus;
+
+use crate::panda::PandaBus;
 use reflection_node::{Node, TopicStream, TopicSubscription, TopicSubscriptionError};
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
@@ -54,6 +56,19 @@ pub struct Settings {
     pub budget: Option<u64>,
     /// Send our cursor position to the others on the open note.
     pub share_cursor: bool,
+    /// "logos" (Logos Delivery through loam_core, the default) or "p2panda" (p2panda_core: the
+    /// network of upstream Reflection, with notes bridged to Logos on request). Takes effect when
+    /// Reflection starts.
+    pub sync_mode: Option<String>,
+}
+
+impl Settings {
+    pub fn mode(&self) -> &str {
+        match self.sync_mode.as_deref() {
+            Some("p2panda") => "p2panda",
+            _ => "logos",
+        }
+    }
 }
 
 /// Reflection's ephemeral message (as `reflection-doc` sends it, postcard-encoded): where
@@ -143,12 +158,25 @@ struct Inner {
     applied: tokio::sync::Mutex<Option<String>>,
     settings: Mutex<Settings>,
     settings_path: PathBuf,
+    /// The node's data directory (also the local snapshot cache).
+    dir: PathBuf,
+    /// The sync mode the running node uses.
+    running_mode: Mutex<String>,
+    /// p2panda_core, when the host has it.
+    panda: Option<Arc<PandaBus>>,
+    /// Bridge state of notes in p2panda mode, by note id ("pending" / "on"), refreshed in the
+    /// background (asking p2panda_core from the module thread would deadlock).
+    bridge_states: Mutex<HashMap<String, String>>,
 }
 
 impl Engine {
     /// Start the engine. The node comes up in the background; documents created before that
     /// are kept in memory and published once it is ready.
-    pub fn start(persist_dir: PathBuf, bus: Arc<dyn DeliveryBus>) -> Self {
+    pub fn start(
+        persist_dir: PathBuf,
+        bus: Arc<dyn DeliveryBus>,
+        panda: Option<Arc<PandaBus>>,
+    ) -> Self {
         let settings_path = persist_dir.join("settings.json");
         let settings: Settings = std::fs::read(&settings_path)
             .ok()
@@ -171,12 +199,25 @@ impl Engine {
             applied: tokio::sync::Mutex::new(None),
             settings: Mutex::new(settings),
             settings_path,
+            dir: persist_dir.clone(),
+            running_mode: Mutex::new(String::new()),
+            panda,
+            bridge_states: Mutex::new(HashMap::new()),
         });
         let task_inner = inner.clone();
         rt.spawn(async move {
             if let Err(error) = task_inner.clone().start_node(persist_dir, bus).await {
                 error!("reflection node failed to start: {error}");
                 *task_inner.node_error.lock().unwrap() = Some(error);
+            }
+        });
+        // Keep the local snapshot of every note that changed, and the bridge states.
+        let cache_inner = inner.clone();
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                cache_inner.save_snapshots();
+                cache_inner.refresh_bridges().await;
             }
         });
         // The view closed: deactivate its note.
@@ -240,6 +281,12 @@ impl Engine {
             };
         }
         let mut stop_sharing = false;
+        if let Some(mode) = changes.get("syncMode").and_then(Value::as_str) {
+            if mode != "logos" && mode != "p2panda" {
+                return Err("syncMode is \"logos\" or \"p2panda\"".into());
+            }
+            settings.sync_mode = Some(mode.to_owned());
+        }
         if let Some(share) = changes.get("shareCursor").and_then(Value::as_bool) {
             stop_sharing = settings.share_cursor && !share;
             settings.share_cursor = share;
@@ -261,7 +308,38 @@ impl Engine {
                     .spawn(async move { doc.send_cursor_now(None).await });
             }
         }
-        Ok(json!({ "ok": true, "settings": settings }))
+        let restart = settings.mode() != self.inner.running_mode.lock().unwrap().as_str();
+        Ok(json!({ "ok": true, "settings": settings, "restartRequired": restart }))
+    }
+
+    /// Ask to carry a note over Logos as well (p2panda mode): it stays pending until the user
+    /// confirms it in the p2panda view. Returns at once; `state` shows the outcome.
+    pub fn bridge(&self, doc_id: &str, on: bool) -> Result<Value, String> {
+        let doc = self.doc(doc_id).ok_or("No such note")?;
+        if self.inner.running_mode.lock().unwrap().as_str() != "p2panda" {
+            return Err("Bridging is for p2panda mode (Message stats > Sync)".into());
+        }
+        let panda = self
+            .inner
+            .panda
+            .clone()
+            .ok_or("p2panda_core is not available")?;
+        let inner = self.inner.clone();
+        let hex = doc.hex();
+        self.rt.spawn(async move {
+            match panda.bridge(Topic::from(doc.id), on).await {
+                Ok(state) => {
+                    let mut states = inner.bridge_states.lock().unwrap();
+                    if state == "off" {
+                        states.remove(&hex);
+                    } else {
+                        states.insert(hex, state);
+                    }
+                }
+                Err(error) => warn!("bridge request failed: {error}"),
+            }
+        });
+        Ok(json!({ "ok": true, "requested": on }))
     }
 
     fn active_doc(&self) -> Option<Arc<Doc>> {
@@ -339,7 +417,18 @@ impl Engine {
             Value::Null
         } else {
             match self.doc(doc_id) {
-                Some(doc) => doc.detail(&me),
+                Some(doc) => {
+                    let mut detail = doc.detail(&me);
+                    detail["bridge"] = json!(self
+                        .inner
+                        .bridge_states
+                        .lock()
+                        .unwrap()
+                        .get(&doc.hex())
+                        .cloned()
+                        .unwrap_or_else(|| "off".into()));
+                    detail
+                }
                 None => Value::Null,
             }
         };
@@ -357,6 +446,8 @@ impl Engine {
             "me": *self.inner.me.lock().unwrap(),
             "transport": *self.inner.transport.lock().unwrap(),
             "settings": *self.inner.settings.lock().unwrap(),
+            "syncMode": *self.inner.running_mode.lock().unwrap(),
+            "p2pandaAvailable": self.inner.panda.is_some(),
             "docs": list,
             "current": current,
         })
@@ -505,10 +596,25 @@ impl Inner {
         let key = load_or_create_key(&persist_dir)?;
         *self.me.lock().unwrap() = Some(key.verifying_key().to_hex());
 
-        let node =
-            Node::with_delivery_bus(key, Hash::digest(NETWORK_NAME), Some(&persist_dir), bus)
+        let mode = self.settings.lock().unwrap().mode().to_owned();
+        let node = match (mode.as_str(), &self.panda) {
+            ("p2panda", Some(panda)) => {
+                let network = Hash::digest(NETWORK_NAME);
+                panda
+                    .network_open(network.to_hex(), key.to_hex())
+                    .await
+                    .map_err(|e| format!("p2panda_core: {e}"))?;
+                info!("syncing through p2panda_core");
+                Node::with_p2panda_bus(key, network, Some(&persist_dir), panda.clone())
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            ("p2panda", None) => return Err("p2panda mode needs the p2panda_core module".into()),
+            _ => Node::with_delivery_bus(key, Hash::digest(NETWORK_NAME), Some(&persist_dir), bus)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?,
+        };
+        *self.running_mode.lock().unwrap() = mode;
 
         // Documents known from earlier runs. Their content comes back from the node's
         // operation store when we subscribe.
@@ -517,10 +623,15 @@ impl Inner {
             let id = topic.topic.to_bytes();
             let hex = hex::encode(id);
             let mut docs = self.docs.lock().unwrap();
-            docs.entry(hex).or_insert_with(|| {
+            docs.entry(hex.clone()).or_insert_with(|| {
                 let doc = Doc::new(id);
                 if let Some(name) = topic.name.as_ref().filter(|n| !n.is_empty()) {
                     *doc.name.lock().unwrap() = name.clone();
+                }
+                // What we had last time, whichever network it came from.
+                if let Ok(bytes) = std::fs::read(self.dir.join("notes").join(format!("{hex}.loro")))
+                {
+                    doc.import_remote(&bytes);
                 }
                 doc
             });
@@ -537,7 +648,63 @@ impl Inner {
         for doc in docs {
             self.subscribe(node, doc).await;
         }
+        self.publish_to_new_network().await;
         Ok(())
+    }
+
+    /// In p2panda mode, notes this device has never published on p2panda (they were on Logos)
+    /// are published there once, as a snapshot, so the others get their content.
+    async fn publish_to_new_network(&self) {
+        if self.running_mode.lock().unwrap().as_str() != "p2panda" {
+            return;
+        }
+        // Give the replay from p2panda_core a moment, so a snapshot includes what it has.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let path = self.dir.join("published-p2panda.json");
+        let mut done: BTreeSet<String> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let docs: Vec<Arc<Doc>> = self.docs.lock().unwrap().values().cloned().collect();
+        for doc in docs {
+            if done.contains(&doc.hex()) {
+                continue;
+            }
+            if !Doc::text(&doc.loro.lock().unwrap()).is_empty() {
+                doc.clone().publish_snapshot().await;
+            }
+            done.insert(doc.hex());
+        }
+        let _ = std::fs::write(&path, serde_json::to_vec(&done).unwrap_or_default());
+    }
+
+    /// Write the snapshot of every note that changed since the last time.
+    fn save_snapshots(&self) {
+        let docs: Vec<Arc<Doc>> = self.docs.lock().unwrap().values().cloned().collect();
+        let dir = self.dir.join("notes");
+        for doc in docs {
+            if !doc.dirty.swap(false, Ordering::SeqCst) {
+                continue;
+            }
+            let Ok(bytes) = doc.loro.lock().unwrap().export(ExportMode::Snapshot) else {
+                continue;
+            };
+            let _ = std::fs::create_dir_all(&dir);
+            let tmp = dir.join(format!("{}.tmp", doc.hex()));
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join(format!("{}.loro", doc.hex())));
+            }
+        }
+    }
+
+    async fn refresh_bridges(&self) {
+        let Some(panda) = &self.panda else { return };
+        if self.running_mode.lock().unwrap().as_str() != "p2panda" {
+            return;
+        }
+        if let Ok(states) = panda.bridges().await {
+            *self.bridge_states.lock().unwrap() = states;
+        }
     }
 
     /// The budget, and how much of it this device has used this epoch.
@@ -587,6 +754,9 @@ impl Inner {
         if doc.subscribing.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some(panda) = &self.panda {
+            panda.set_label(Topic::from(doc.id), doc.display_name());
+        }
         let subscription = DocSubscription {
             doc: Arc::downgrade(&doc),
         };
@@ -635,6 +805,8 @@ pub struct Doc {
     online: Mutex<BTreeSet<String>>,
     name: Mutex<String>,
     updated: AtomicU64,
+    /// Changed since its snapshot was last saved locally.
+    dirty: AtomicBool,
 }
 
 pub struct LocalEdit {
@@ -665,6 +837,7 @@ impl Doc {
             online: Mutex::new(BTreeSet::new()),
             name: Mutex::new(String::new()),
             updated: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
         });
         let frontiers = doc.loro.lock().unwrap().oplog_frontiers();
         doc.record(frontiers);
@@ -814,6 +987,7 @@ impl Doc {
     }
 
     fn changed(&self, text: &str) {
+        self.dirty.store(true, Ordering::SeqCst);
         let name = name_of(text);
         *self.name.lock().unwrap() = name;
         self.updated.store(now_secs(), Ordering::SeqCst);
@@ -1203,7 +1377,7 @@ mod tests {
             Arc::new(MemoryBus::new())
         };
         std::mem::forget(rt);
-        let engine = Engine::start(dir.to_owned(), bus);
+        let engine = Engine::start(dir.to_owned(), bus, None);
         engine.wait_ready();
         engine
     }

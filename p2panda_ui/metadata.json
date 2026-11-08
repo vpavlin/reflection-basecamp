@@ -1,0 +1,16 @@
+{
+  "name": "p2panda",
+  "display_name": "p2panda",
+  "version": "0.1.0",
+  "type": "ui_qml",
+  "category": "network",
+  "description": "The device's shared p2panda node (p2panda_core): its networks and the apps using them, and the topics bridged to Logos Delivery. Approve or stop bridges here: they spend this device's Logos messages.",
+  "view": "Main.qml",
+  "icon": "icon.png",
+  "dependencies": ["p2panda_core"],
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": { "find_packages": [] }
+  }
+}

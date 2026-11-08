@@ -9,6 +9,7 @@
 
 mod engine;
 mod loam;
+mod panda;
 
 /// The methods the Reflection view calls.
 pub trait ReflectionCoreModule: Send + 'static {
@@ -46,6 +47,10 @@ pub trait ReflectionCoreModule: Send + 'static {
 
     /// Change settings, given as a JSON object with any of the keys of `settings`.
     fn set_settings(&mut self, changes: String) -> String;
+
+    /// p2panda mode: ask ("true") to carry a note over Logos Delivery as well (pending until the
+    /// user confirms it in the p2panda view), or stop ("false").
+    fn bridge_note(&mut self, doc_id: String, on: String) -> String;
 
     /// Called once the module is wired to the host.
     #[cfg(not(test))]
