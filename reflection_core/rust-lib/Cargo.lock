@@ -807,7 +807,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -4203,7 +4203,7 @@ dependencies = [
 [[package]]
 name = "reflection-node"
 version = "0.5.0"
-source = "git+https://github.com/vpavlin/reflection?rev=bb802806850984d723b72e6d86f8b907b1217522#bb802806850984d723b72e6d86f8b907b1217522"
+source = "git+https://github.com/vpavlin/reflection?rev=000bf8bc7bccb2ca47979d0ddc7032ff907d9cae#000bf8bc7bccb2ca47979d0ddc7032ff907d9cae"
 dependencies = [
  "chacha20poly1305",
  "chrono",
@@ -4229,8 +4229,10 @@ dependencies = [
  "loro",
  "p2panda",
  "p2panda-core",
+ "postcard",
  "rand 0.8.6",
  "reflection-node",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

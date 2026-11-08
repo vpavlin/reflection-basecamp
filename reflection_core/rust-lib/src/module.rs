@@ -59,6 +59,32 @@ impl ReflectionCoreModule for Core {
         self.with_engine(|e| Ok(e.stats()))
     }
 
+    fn set_cursor(
+        &mut self,
+        doc_id: String,
+        base_version: String,
+        position: String,
+        anchor: String,
+    ) -> String {
+        let number = |s: &str| {
+            s.trim()
+                .trim_matches('"')
+                .parse::<i64>()
+                .map_err(|_| "Bad cursor position".to_owned())
+        };
+        self.with_engine(|e| {
+            e.set_cursor(&doc_id, &base_version, number(&position)?, number(&anchor)?)
+        })
+    }
+
+    fn settings(&mut self) -> String {
+        self.with_engine(|e| Ok(e.settings()))
+    }
+
+    fn set_settings(&mut self, changes: String) -> String {
+        self.with_engine(|e| e.set_settings(&changes))
+    }
+
     fn remove_document(&mut self, doc_id: String) -> String {
         self.with_engine(|e| e.remove(&doc_id))
     }

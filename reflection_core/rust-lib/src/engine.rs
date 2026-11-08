@@ -8,8 +8,10 @@
 //! Message budget (RLN): Logos Delivery charges per message published, so the engine publishes
 //! as little as it can (reflection ADR 0008). Every note is subscribed in the background, which
 //! receives and costs nothing; only the note open in the view is active (presence, catch-up).
-//! Local edits are merged and published at most once per `publish_interval`, and one snapshot
-//! follows after the user stops typing.
+//! Local edits are merged and published at most once per `publish_wait`, and one snapshot
+//! follows after the user stops typing. Nobody knows the real RLN limits yet, so the engine
+//! assumes none: the user can set a pretend budget per epoch (`Settings`) to try out tiers,
+//! and pacing follows it.
 //!
 //! Threading: every public method is called on the host's module thread and returns quickly.
 //! Anything that touches the network or the database runs on the engine's own tokio runtime.
@@ -38,16 +40,78 @@ const NETWORK_NAME: &[u8] = b"reflection-v2";
 /// A snapshot is published once the user has stopped typing for this long.
 const SNAPSHOT_QUIET: Duration = Duration::from_secs(10);
 
-/// Messages per RLN epoch (10 minutes) the engine plans for. The smallest membership allows
-/// 100, shared with every other app on the node, so edits slow down well before that.
-pub const EPOCH_BUDGET: u64 = 100;
+/// Merged local edits are published at most this often while the budget allows.
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Merged local edits are published at most this often...
-const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
-/// ...this often once half the epoch budget is used...
-const PUBLISH_INTERVAL_HALF: Duration = Duration::from_secs(10);
-/// ...and this often past 80 %.
-const PUBLISH_INTERVAL_LOW: Duration = Duration::from_secs(30);
+/// Our cursor is sent at most this often (or half as often as edits, when budget is short).
+const CURSOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// User settings, kept in `settings.json`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Settings {
+    /// Pretend RLN budget, messages per 10-minute epoch. `None`: no limit.
+    pub budget: Option<u64>,
+    /// Send our cursor position to the others on the open note.
+    pub share_cursor: bool,
+}
+
+/// Reflection's ephemeral message (as `reflection-doc` sends it, postcard-encoded): where
+/// someone's cursor is, as Loro cursors that stay on their character as the text changes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum EphemeralData {
+    Cursor {
+        insert_cursor: Option<loro::cursor::Cursor>,
+        selection_bound: Option<loro::cursor::Cursor>,
+    },
+}
+
+/// How a budget is being spent this epoch.
+#[derive(Clone, Copy, Debug)]
+struct Spend {
+    budget: Option<u64>,
+    used: u64,
+    seconds_left: u64,
+}
+
+impl Spend {
+    /// Kept back for presence and catch-up.
+    fn reserve(budget: u64) -> u64 {
+        (budget / 20).max(2)
+    }
+
+    /// How long to wait before publishing merged edits: the base interval while less than half
+    /// the budget is used, then the rest spread over the rest of the epoch, and nothing once only
+    /// the reserve is left (until the next epoch).
+    fn publish_wait(&self) -> Duration {
+        let Some(budget) = self.budget else {
+            return PUBLISH_INTERVAL;
+        };
+        let remaining = budget.saturating_sub(self.used);
+        let reserve = Self::reserve(budget);
+        if self.used * 2 < budget {
+            PUBLISH_INTERVAL
+        } else if remaining <= reserve {
+            Duration::from_secs(self.seconds_left + 1)
+        } else {
+            PUBLISH_INTERVAL.max(Duration::from_secs_f64(
+                self.seconds_left as f64 / (remaining - reserve) as f64,
+            ))
+        }
+    }
+
+    /// Cursors come after edits: half as often, and not at all when the budget is short.
+    fn cursor_wait(&self) -> Option<Duration> {
+        let Some(budget) = self.budget else {
+            return Some(CURSOR_INTERVAL);
+        };
+        let remaining = budget.saturating_sub(self.used);
+        if remaining <= Self::reserve(budget) * 3 {
+            return None;
+        }
+        Some(CURSOR_INTERVAL.max(self.publish_wait() * 2))
+    }
+}
 
 /// The view polls `state` every second; without a poll for this long, nothing is open.
 const VIEW_GONE: Duration = Duration::from_secs(20);
@@ -77,12 +141,19 @@ struct Inner {
     last_poll: Mutex<Instant>,
     /// The note whose stream is active now; changed only by `apply_active`, one at a time.
     applied: tokio::sync::Mutex<Option<String>>,
+    settings: Mutex<Settings>,
+    settings_path: PathBuf,
 }
 
 impl Engine {
     /// Start the engine. The node comes up in the background; documents created before that
     /// are kept in memory and published once it is ready.
     pub fn start(persist_dir: PathBuf, bus: Arc<dyn DeliveryBus>) -> Self {
+        let settings_path = persist_dir.join("settings.json");
+        let settings: Settings = std::fs::read(&settings_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("reflection")
@@ -98,6 +169,8 @@ impl Engine {
             active: Mutex::new(None),
             last_poll: Mutex::new(Instant::now()),
             applied: tokio::sync::Mutex::new(None),
+            settings: Mutex::new(settings),
+            settings_path,
         });
         let task_inner = inner.clone();
         rt.spawn(async move {
@@ -137,6 +210,87 @@ impl Engine {
         self.rt.spawn(async move { inner.apply_active().await });
     }
 
+    pub fn settings(&self) -> Value {
+        json!({ "ok": true, "settings": *self.inner.settings.lock().unwrap() })
+    }
+
+    /// Change settings: a JSON object with any of `budget` (a number, or null for no limit)
+    /// and `shareCursor`.
+    pub fn set_settings(&self, changes: &str) -> Result<Value, String> {
+        let changes: Value =
+            serde_json::from_str(changes.trim()).map_err(|e| format!("Bad settings: {e}"))?;
+        let mut settings = self.inner.settings.lock().unwrap().clone();
+        if let Some(budget) = changes.get("budget") {
+            settings.budget = match budget {
+                Value::Null => None,
+                Value::Number(n) => Some(
+                    n.as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or("The budget is a positive whole number")?,
+                ),
+                Value::String(s) if s.trim().is_empty() => None,
+                Value::String(s) => Some(
+                    s.trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or("The budget is a positive whole number")?,
+                ),
+                _ => return Err("The budget is a positive whole number".into()),
+            };
+        }
+        let mut stop_sharing = false;
+        if let Some(share) = changes.get("shareCursor").and_then(Value::as_bool) {
+            stop_sharing = settings.share_cursor && !share;
+            settings.share_cursor = share;
+        }
+        if let Err(error) = std::fs::write(
+            &self.inner.settings_path,
+            serde_json::to_vec_pretty(&settings).unwrap_or_default(),
+        ) {
+            warn!("can't save settings: {error}");
+        }
+        if let Some(node) = self.inner.node.get() {
+            node.set_message_budget(settings.budget);
+        }
+        *self.inner.settings.lock().unwrap() = settings.clone();
+        if stop_sharing {
+            // Take our cursor off the others' screens.
+            if let Some(doc) = self.active_doc() {
+                self.rt
+                    .spawn(async move { doc.send_cursor_now(None).await });
+            }
+        }
+        Ok(json!({ "ok": true, "settings": settings }))
+    }
+
+    fn active_doc(&self) -> Option<Arc<Doc>> {
+        let active = self.inner.active.lock().unwrap().clone()?;
+        self.doc(&active)
+    }
+
+    /// Where the user's cursor is in the open note: UTF-16 offsets (as QML counts them) into
+    /// the text of version `base`. Sent to the others if the user shares their cursor.
+    pub fn set_cursor(
+        &self,
+        doc_id: &str,
+        base: &str,
+        position: i64,
+        anchor: i64,
+    ) -> Result<Value, String> {
+        let doc = self.doc(doc_id).ok_or("No such note")?;
+        let base = base.trim().trim_matches('"').parse::<u64>().ok();
+        doc.set_own_cursor(base, position, anchor)?;
+        if self.inner.settings.lock().unwrap().share_cursor {
+            if let Some(wait) = self.inner.spend().cursor_wait() {
+                let doc = doc.clone();
+                self.rt
+                    .spawn(async move { doc.request_cursor_publish(wait) });
+            }
+        }
+        Ok(json!({ "ok": true }))
+    }
+
     /// Message counters, for the debug panel: what this device sent and received over Logos
     /// Delivery, per RLN epoch and per note.
     pub fn stats(&self) -> Value {
@@ -153,14 +307,14 @@ impl Engine {
             .iter()
             .map(|(id, doc)| (id.clone(), doc.display_name()))
             .collect();
-        let sent = stats
-            .as_ref()
-            .map(|s| s.sent_this_epoch.messages())
-            .unwrap_or(0);
+        let spend = self.inner.spend();
+        let settings = self.inner.settings.lock().unwrap().clone();
         json!({
             "ok": true,
-            "budget": EPOCH_BUDGET,
-            "publishInterval": publish_interval(sent).as_secs(),
+            "settings": settings,
+            "budget": settings.budget,
+            "publishInterval": spend.publish_wait().as_secs_f64(),
+            "cursorInterval": spend.cursor_wait().map(|d| d.as_secs_f64()),
             "snapshotQuiet": SNAPSHOT_QUIET.as_secs(),
             "active": *self.inner.active.lock().unwrap(),
             "names": names,
@@ -202,6 +356,7 @@ impl Engine {
             "node": node,
             "me": *self.inner.me.lock().unwrap(),
             "transport": *self.inner.transport.lock().unwrap(),
+            "settings": *self.inner.settings.lock().unwrap(),
             "docs": list,
             "current": current,
         })
@@ -248,7 +403,7 @@ impl Engine {
         let base = base.trim().trim_matches('"').parse::<u64>().ok();
         let edit = doc.local_edit(base, text)?;
         if edit.changed {
-            let interval = self.inner.publish_interval();
+            let interval = self.inner.spend().publish_wait();
             let doc = doc.clone();
             self.rt.spawn(async move { doc.request_publish(interval) });
         }
@@ -371,6 +526,7 @@ impl Inner {
             });
         }
 
+        node.set_message_budget(self.settings.lock().unwrap().budget);
         let node = match self.node.set(node) {
             Ok(()) => self.node.get().unwrap(),
             Err(_) => return Err("node started twice".into()),
@@ -384,16 +540,21 @@ impl Inner {
         Ok(())
     }
 
-    /// How long to wait between publishing merged edits, given what this device already sent
-    /// in the current epoch.
-    fn publish_interval(&self) -> Duration {
-        let sent = self
-            .node
-            .get()
-            .and_then(|node| node.transport_stats())
-            .map(|s| s.sent_this_epoch.messages())
-            .unwrap_or(0);
-        publish_interval(sent)
+    /// The budget, and how much of it this device has used this epoch.
+    fn spend(&self) -> Spend {
+        let budget = self.settings.lock().unwrap().budget;
+        let stats = self.node.get().and_then(|node| node.transport_stats());
+        Spend {
+            budget,
+            used: stats
+                .as_ref()
+                .map(|s| s.sent_this_epoch.messages())
+                .unwrap_or(0),
+            seconds_left: stats
+                .as_ref()
+                .map(|s| s.epoch_seconds.saturating_sub(s.epoch_elapsed))
+                .unwrap_or(600),
+        }
     }
 
     /// Make the streams match `active`, the note the view has open. Calls are serialized and
@@ -465,6 +626,12 @@ pub struct Doc {
     last_publish: Mutex<Option<Instant>>,
     /// Bumped on every publish; a snapshot is due when it stops changing.
     edit_generation: AtomicU64,
+    /// Our cursor and selection bound, and its sending.
+    own_cursor: Mutex<(Option<loro::cursor::Cursor>, Option<loro::cursor::Cursor>)>,
+    cursor_scheduled: AtomicBool,
+    last_cursor_sent: Mutex<Option<Instant>>,
+    /// Other people's cursors: author -> (timestamp, cursor, selection bound).
+    cursors: Mutex<BTreeMap<String, (u64, loro::cursor::Cursor, Option<loro::cursor::Cursor>)>>,
     online: Mutex<BTreeSet<String>>,
     name: Mutex<String>,
     updated: AtomicU64,
@@ -491,6 +658,10 @@ impl Doc {
             publish_scheduled: AtomicBool::new(false),
             last_publish: Mutex::new(None),
             edit_generation: AtomicU64::new(0),
+            own_cursor: Mutex::new((None, None)),
+            cursor_scheduled: AtomicBool::new(false),
+            last_cursor_sent: Mutex::new(None),
+            cursors: Mutex::new(BTreeMap::new()),
             online: Mutex::new(BTreeSet::new()),
             name: Mutex::new(String::new()),
             updated: AtomicU64::new(0),
@@ -648,6 +819,126 @@ impl Doc {
         self.updated.store(now_secs(), Ordering::SeqCst);
     }
 
+    /// Our cursor, at UTF-16 offsets into the text of version `base`.
+    fn set_own_cursor(&self, base: Option<u64>, position: i64, anchor: i64) -> Result<(), String> {
+        let loro = self.loro.lock().unwrap();
+        let frontiers = base
+            .and_then(|b| self.version_frontiers(b))
+            .filter(|f| *f != loro.oplog_frontiers());
+        let cursor_at = |doc: &LoroDoc| {
+            let text = doc.get_text(&*TEXT_ID);
+            let content = text.to_string();
+            let at =
+                |utf16: i64| text.get_cursor(utf16_to_chars(&content, utf16), Default::default());
+            let insert = at(position);
+            let bound = (anchor != position && anchor >= 0)
+                .then(|| at(anchor))
+                .flatten();
+            (insert, bound)
+        };
+        let cursors = match frontiers {
+            Some(frontiers) => {
+                let fork = loro.fork_at(&frontiers).map_err(|e| e.to_string())?;
+                cursor_at(&fork)
+            }
+            None => cursor_at(&loro),
+        };
+        *self.own_cursor.lock().unwrap() = cursors;
+        Ok(())
+    }
+
+    /// Send our cursor, at most once per `wait`.
+    fn request_cursor_publish(self: Arc<Self>, wait: Duration) {
+        if self.cursor_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let wait = match *self.last_cursor_sent.lock().unwrap() {
+            Some(at) => wait.saturating_sub(at.elapsed()),
+            None => Duration::ZERO,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            self.cursor_scheduled.store(false, Ordering::SeqCst);
+            let cursor = self.own_cursor.lock().unwrap().clone();
+            self.send_cursor_now(Some(cursor)).await;
+        });
+    }
+
+    /// Send a cursor (`None`: "no cursor", which takes it off the others' screens).
+    async fn send_cursor_now(
+        self: Arc<Self>,
+        cursor: Option<(Option<loro::cursor::Cursor>, Option<loro::cursor::Cursor>)>,
+    ) {
+        let stream = self.stream.lock().unwrap().clone();
+        let Some(stream) = stream else { return };
+        let (insert_cursor, selection_bound) = cursor.unwrap_or((None, None));
+        let data = EphemeralData::Cursor {
+            insert_cursor,
+            selection_bound,
+        };
+        let bytes = match postcard::to_allocvec(&data) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                error!("can't encode cursor: {error}");
+                return;
+            }
+        };
+        *self.last_cursor_sent.lock().unwrap() = Some(Instant::now());
+        if let Err(error) = stream.publish_ephemeral(bytes).await {
+            warn!(doc = %self.hex(), "can't send cursor: {error}");
+        }
+    }
+
+    /// Someone's cursor (an ephemeral message), unless we already have a newer one.
+    fn remote_cursor(&self, author: &str, timestamp: u64, data: &[u8]) {
+        let Ok(EphemeralData::Cursor {
+            insert_cursor,
+            selection_bound,
+        }) = postcard::from_bytes::<EphemeralData>(data)
+        else {
+            return;
+        };
+        let mut cursors = self.cursors.lock().unwrap();
+        if cursors
+            .get(author)
+            .is_some_and(|(at, _, _)| *at > timestamp)
+        {
+            return;
+        }
+        match insert_cursor {
+            Some(cursor) => {
+                cursors.insert(author.to_owned(), (timestamp, cursor, selection_bound));
+            }
+            None => {
+                cursors.remove(author);
+            }
+        }
+    }
+
+    /// Other people's cursors in the current text, as UTF-16 offsets.
+    fn cursor_positions(&self, me: &str) -> Vec<Value> {
+        let cursors = self.cursors.lock().unwrap().clone();
+        if cursors.is_empty() {
+            return Vec::new();
+        }
+        let loro = self.loro.lock().unwrap();
+        let text = Self::text(&loro);
+        let pos = |cursor: &loro::cursor::Cursor| {
+            loro.get_cursor_pos(cursor)
+                .ok()
+                .map(|result| chars_to_utf16(&text, result.current.pos))
+        };
+        cursors
+            .iter()
+            .filter(|(author, _)| author.as_str() != me)
+            .filter_map(|(author, (_, insert, bound))| {
+                let at = pos(insert)?;
+                let anchor = bound.as_ref().and_then(pos).unwrap_or(at);
+                Some(json!({ "author": author, "pos": at, "anchor": anchor }))
+            })
+            .collect()
+    }
+
     /// How far this peer's own changes go (the end of its counter range).
     fn own_counter(loro: &LoroDoc) -> i32 {
         loro.oplog_vv().get(&loro.peer_id()).copied().unwrap_or(0)
@@ -787,6 +1078,7 @@ impl Doc {
             "text": text,
             "version": self.current_version().to_string(),
             "online": self.others_online(me),
+            "cursors": self.cursor_positions(me),
             "subscribed": self.stream.lock().unwrap().is_some(),
         })
     }
@@ -804,8 +1096,10 @@ impl TopicSubscription for DocSubscription {
         }
     }
 
-    fn ephemeral_bytes_received(&self, _author: VerifyingKey, _timestamp: u64, _data: Vec<u8>) {
-        // Cursors of other people; the Basecamp view does not show them yet.
+    fn ephemeral_bytes_received(&self, author: VerifyingKey, timestamp: u64, data: Vec<u8>) {
+        if let Some(doc) = self.doc.upgrade() {
+            doc.remote_cursor(&author.to_hex(), timestamp, &data);
+        }
     }
 
     fn author_joined(&self, author: VerifyingKey) {
@@ -817,6 +1111,7 @@ impl TopicSubscription for DocSubscription {
     fn author_left(&self, author: VerifyingKey) {
         if let Some(doc) = self.doc.upgrade() {
             doc.online.lock().unwrap().remove(&author.to_hex());
+            doc.cursors.lock().unwrap().remove(&author.to_hex());
         }
     }
 
@@ -825,15 +1120,21 @@ impl TopicSubscription for DocSubscription {
     }
 }
 
-/// See `PUBLISH_INTERVAL`.
-fn publish_interval(sent_this_epoch: u64) -> Duration {
-    if sent_this_epoch * 10 >= EPOCH_BUDGET * 8 {
-        PUBLISH_INTERVAL_LOW
-    } else if sent_this_epoch * 2 >= EPOCH_BUDGET {
-        PUBLISH_INTERVAL_HALF
-    } else {
-        PUBLISH_INTERVAL
+/// A UTF-16 offset (QML) as a character offset (Loro), clamped to the text.
+fn utf16_to_chars(text: &str, utf16: i64) -> usize {
+    let mut units = 0i64;
+    for (chars, c) in text.chars().enumerate() {
+        if units >= utf16 {
+            return chars;
+        }
+        units += c.len_utf16() as i64;
     }
+    text.chars().count()
+}
+
+/// A character offset (Loro) as a UTF-16 offset (QML).
+fn chars_to_utf16(text: &str, chars: usize) -> usize {
+    text.chars().take(chars).map(char::len_utf16).sum()
 }
 
 /// The first non-empty line, without Markdown heading marks.
@@ -1075,8 +1376,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         wait_for(&b, &id, &typed);
-        // 1.5 s of typing at one publish per 2 s: the first keystroke, then the rest merged.
-        assert!(sent(&a, "ops") <= 2, "{}", a.stats());
+        // 30 keystrokes over 1.5 s at one publish per second: the first keystroke, then the
+        // rest merged into one or two.
+        assert!(sent(&a, "ops") <= 3, "{}", a.stats());
 
         // One snapshot once the typing stopped.
         for _ in 0..300 {
@@ -1087,7 +1389,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_secs(1));
         assert_eq!(sent(&a, "snapshots"), 1, "{}", a.stats());
-        assert!(sent(&a, "ops") <= 2, "{}", a.stats());
+        assert!(sent(&a, "ops") <= 3, "{}", a.stats());
     }
 
     #[test]
@@ -1114,6 +1416,108 @@ mod tests {
         assert!(a.join("abcd").is_err());
         let id = hex::encode([7u8; 32]);
         assert_eq!(a.join(&id.to_uppercase()).unwrap()["id"], id);
+    }
+
+    #[test]
+    fn cursors_go_both_ways_when_shared() {
+        let a = device(&tempdir("a"));
+        let b = device(&tempdir("b"));
+        let id = a.create("hello world").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        b.join(&id).unwrap();
+        wait_for(&b, &id, "hello world\n");
+        wait_for(&a, &id, "hello world\n");
+
+        // Not shared: nothing goes out.
+        a.set_cursor(&id, &version(&a, &id), 6, 6).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(sent(&a, "cursors"), 0);
+        assert_eq!(b.state(&id)["current"]["cursors"], json!([]));
+
+        // Shared: B sees A's cursor before "world", and it stays there as B edits before it.
+        a.set_settings(r#"{"shareCursor": true}"#).unwrap();
+        a.set_cursor(&id, &version(&a, &id), 6, 6).unwrap();
+        let a_me = a.state(&id)["me"].clone();
+        let mut seen = Value::Null;
+        for _ in 0..100 {
+            seen = b.state(&id)["current"]["cursors"].clone();
+            if seen != json!([]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(seen, json!([{ "author": a_me, "pos": 6, "anchor": 6 }]));
+        b.set_text(&id, &version(&b, &id), "oh, hello world\n")
+            .unwrap();
+        assert_eq!(b.state(&id)["current"]["cursors"][0]["pos"], 10);
+        assert_eq!(sent(&a, "cursors"), 1);
+
+        // Turning sharing off takes it off B's screen.
+        a.set_settings(r#"{"shareCursor": false}"#).unwrap();
+        for _ in 0..100 {
+            if b.state(&id)["current"]["cursors"] == json!([]) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("cursor still shown: {}", b.state(&id)["current"]["cursors"]);
+    }
+
+    #[test]
+    fn settings_persist_and_apply_the_budget() {
+        let dir = tempdir("settings");
+        {
+            let a = device(&dir);
+            assert_eq!(a.settings()["settings"]["budget"], Value::Null);
+            a.set_settings(r#"{"budget": "250"}"#).unwrap();
+            assert!(a.set_settings(r#"{"budget": "-3"}"#).is_err());
+            assert_eq!(a.stats()["stats"]["budget"], 250);
+        }
+        let a = device(&dir);
+        assert_eq!(a.settings()["settings"]["budget"], 250);
+        assert_eq!(a.stats()["stats"]["budget"], 250);
+        a.set_settings(r#"{"budget": null}"#).unwrap();
+        assert_eq!(a.stats()["stats"]["budget"], Value::Null);
+    }
+
+    #[test]
+    fn pacing_follows_the_budget() {
+        let spend = |budget: Option<u64>, used: u64, seconds_left: u64| Spend {
+            budget,
+            used,
+            seconds_left,
+        };
+        // No limit, or less than half used: the base interval.
+        assert_eq!(spend(None, 5000, 300).publish_wait(), PUBLISH_INTERVAL);
+        assert_eq!(spend(Some(100), 49, 300).publish_wait(), PUBLISH_INTERVAL);
+        // Past half: what is left (less the reserve of 5) spread over the rest of the epoch.
+        assert_eq!(
+            spend(Some(100), 55, 400).publish_wait(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(spend(Some(600), 300, 100).publish_wait(), PUBLISH_INTERVAL);
+        // Only the reserve left: wait for the next epoch.
+        assert_eq!(
+            spend(Some(100), 95, 120).publish_wait(),
+            Duration::from_secs(121)
+        );
+        // Cursors: half as often as edits, none when short.
+        assert_eq!(
+            spend(Some(100), 55, 400).cursor_wait(),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(spend(Some(100), 86, 400).cursor_wait(), None);
+        assert_eq!(spend(None, 0, 600).cursor_wait(), Some(CURSOR_INTERVAL));
+    }
+
+    #[test]
+    fn utf16_offsets() {
+        let text = "a😀b";
+        assert_eq!(utf16_to_chars(text, 3), 2);
+        assert_eq!(chars_to_utf16(text, 2), 3);
+        assert_eq!(utf16_to_chars(text, 99), 3);
     }
 
     #[test]

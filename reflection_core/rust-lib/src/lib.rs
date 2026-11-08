@@ -31,6 +31,22 @@ pub trait ReflectionCoreModule: Send + 'static {
     /// note, with the budget the engine plans for.
     fn stats(&mut self) -> String;
 
+    /// Where the user's cursor is: UTF-16 offsets `position` and selection `anchor` into the
+    /// text of `base_version`. Sent to the others only if cursor sharing is on.
+    fn set_cursor(
+        &mut self,
+        doc_id: String,
+        base_version: String,
+        position: String,
+        anchor: String,
+    ) -> String;
+
+    /// Settings: `budget` (pretend messages per RLN epoch, null for no limit), `shareCursor`.
+    fn settings(&mut self) -> String;
+
+    /// Change settings, given as a JSON object with any of the keys of `settings`.
+    fn set_settings(&mut self, changes: String) -> String;
+
     /// Called once the module is wired to the host.
     #[cfg(not(test))]
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
