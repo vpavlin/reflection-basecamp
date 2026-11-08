@@ -24,6 +24,8 @@ public:
     int calls = 0;
     int delayMs = 0;
     bool shareCursor = false;
+    QString syncMode = "logos";
+    bool bridgeRequested = false;
     QString lastCursor;
     QJsonArray remoteCursors;
     Q_INVOKABLE QString callModule(const QString &mod, const QString &method, const QVariant &args);
@@ -68,11 +70,15 @@ QString FakeCore::callModule(const QString &mod, const QString &method, const QV
         r["docs"] = list; r["node"] = "ready"; r["me"] = "cafe1234";
         r["transport"] = QJsonObject{{"status", "Connected"}, {"connected", true}, {"metrics", QJsonObject{{"peers", 6}}}};
         r["current"] = docs.contains(arg(0)) ? QJsonValue(detail(arg(0), docs[arg(0)])) : QJsonValue();
-        r["settings"] = QJsonObject{{"budget", QJsonValue()}, {"shareCursor", shareCursor}};
+        r["settings"] = QJsonObject{{"budget", QJsonValue()}, {"shareCursor", shareCursor}, {"syncMode", syncMode}};
+        r["syncMode"] = syncMode; r["p2pandaAvailable"] = true;
     } else if (method == "set_settings") {
         QJsonObject c = QJsonDocument::fromJson(arg(0).toUtf8()).object();
         if (c.contains("shareCursor")) shareCursor = c["shareCursor"].toBool();
-        r["settings"] = QJsonObject{{"budget", c.contains("budget") ? c["budget"] : QJsonValue()}, {"shareCursor", shareCursor}};
+        if (c.contains("syncMode")) { syncMode = c["syncMode"].toString(); r["switching"] = true; }
+        r["settings"] = QJsonObject{{"budget", c.contains("budget") ? c["budget"] : QJsonValue()}, {"shareCursor", shareCursor}, {"syncMode", syncMode}};
+    } else if (method == "bridge_note") {
+        bridgeRequested = arg(1) == "true";
     } else if (method == "set_cursor") {
         lastCursor = arg(2) + "," + arg(3);
     } else if (method == "create_document") {
@@ -272,8 +278,19 @@ int main(int argc, char **argv) {
                                     check(tints.contains(c.name()), "someone else's cursor is drawn in their colour");
                                     fprintf(stderr, "[remote] at %.0f,%.0f colour %s\n", p.x(), p.y(), qPrintable(c.name()));
                                     grab(&view, out + "/09-cursors.png");
-                                    fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
-                                    QGuiApplication::exit(failures);
+                                    // On Logos, "Also on p2panda" asks, then switches and bridges.
+                                    js(&view, "bridgeFromLogos()");
+                                    check(js(&view, "confirmSwitch").toBool(), "Also on p2panda asks first");
+                                    grab(&view, out + "/10-switch-ask.png");
+                                    js(&view, "bridgeFromLogos()");
+                                    eventually(&view, "p2pandaMode === true", "the view follows the switch to p2panda", 5000, [&] {
+                                        QTimer::singleShot(500, [&] {
+                                            check(core->bridgeRequested, "after the switch the note's bridge is requested");
+                                            grab(&view, out + "/11-p2panda.png");
+                                            fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
+                                            QGuiApplication::exit(failures);
+                                        });
+                                    });
                                 });
                             });
                         });

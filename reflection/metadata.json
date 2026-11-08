@@ -1,7 +1,7 @@
 {
   "name": "reflection",
   "display_name": "Reflection",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "ui_qml",
   "category": "productivity",
   "description": "Collaborative notes: p2panda Reflection on Logos Delivery. Share a note's id and edit it together. Needs reflection_core and loam_core.",

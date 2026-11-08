@@ -146,7 +146,12 @@ pub struct Engine {
 }
 
 struct Inner {
-    node: tokio::sync::OnceCell<Node>,
+    /// The running node; replaced when the sync mode changes.
+    node: Mutex<Option<Arc<Node>>>,
+    /// Serializes starting and switching the node.
+    switching: tokio::sync::Mutex<()>,
+    /// Logos Delivery through loam_core, for the logos mode.
+    bus: Arc<dyn DeliveryBus>,
     node_error: Mutex<Option<String>>,
     docs: Mutex<BTreeMap<String, Arc<Doc>>>,
     me: Mutex<Option<String>>,
@@ -189,7 +194,9 @@ impl Engine {
             .build()
             .expect("tokio runtime");
         let inner = Arc::new(Inner {
-            node: tokio::sync::OnceCell::new(),
+            node: Mutex::new(None),
+            switching: tokio::sync::Mutex::new(()),
+            bus: bus.clone(),
             node_error: Mutex::new(None),
             docs: Mutex::new(BTreeMap::new()),
             me: Mutex::new(None),
@@ -206,7 +213,7 @@ impl Engine {
         });
         let task_inner = inner.clone();
         rt.spawn(async move {
-            if let Err(error) = task_inner.clone().start_node(persist_dir, bus).await {
+            if let Err(error) = task_inner.clone().start_node().await {
                 error!("reflection node failed to start: {error}");
                 *task_inner.node_error.lock().unwrap() = Some(error);
             }
@@ -297,9 +304,10 @@ impl Engine {
         ) {
             warn!("can't save settings: {error}");
         }
-        if let Some(node) = self.inner.node.get() {
+        if let Some(node) = self.inner.node() {
             node.set_message_budget(settings.budget);
         }
+        let switch = settings.mode() != self.inner.running_mode.lock().unwrap().as_str();
         *self.inner.settings.lock().unwrap() = settings.clone();
         if stop_sharing {
             // Take our cursor off the others' screens.
@@ -308,8 +316,11 @@ impl Engine {
                     .spawn(async move { doc.send_cursor_now(None).await });
             }
         }
-        let restart = settings.mode() != self.inner.running_mode.lock().unwrap().as_str();
-        Ok(json!({ "ok": true, "settings": settings, "restartRequired": restart }))
+        if switch {
+            let inner = self.inner.clone();
+            self.rt.spawn(async move { inner.switch_node().await });
+        }
+        Ok(json!({ "ok": true, "settings": settings, "switching": switch }))
     }
 
     /// Ask to carry a note over Logos as well (p2panda mode): it stays pending until the user
@@ -372,11 +383,7 @@ impl Engine {
     /// Message counters, for the debug panel: what this device sent and received over Logos
     /// Delivery, per RLN epoch and per note.
     pub fn stats(&self) -> Value {
-        let stats = self
-            .inner
-            .node
-            .get()
-            .and_then(|node| node.transport_stats());
+        let stats = self.inner.node().and_then(|node| node.transport_stats());
         let names: BTreeMap<String, String> = self
             .inner
             .docs
@@ -432,10 +439,7 @@ impl Engine {
                 None => Value::Null,
             }
         };
-        let node = match (
-            &*self.inner.node_error.lock().unwrap(),
-            self.inner.node.get(),
-        ) {
+        let node = match (&*self.inner.node_error.lock().unwrap(), self.inner.node()) {
             (Some(error), _) => format!("error: {error}"),
             (None, Some(_)) => "ready".to_owned(),
             (None, None) => "starting".to_owned(),
@@ -529,7 +533,7 @@ impl Engine {
                     let _ = stream.unsubscribe().await;
                 }
             }
-            if let Some(node) = inner.node.get() {
+            if let Some(node) = inner.node() {
                 if let Err(error) = node.delete_topic(Topic::from(doc.id)).await {
                     warn!("can't delete note: {error}");
                 }
@@ -551,8 +555,8 @@ impl Engine {
             .insert(doc.hex(), doc.clone());
         let inner = self.inner.clone();
         self.rt.spawn(async move {
-            if let Some(node) = inner.node.get() {
-                inner.subscribe(node, doc).await;
+            if let Some(node) = inner.node() {
+                inner.subscribe(&node, doc).await;
             }
             // Otherwise start_node subscribes every document once the node is up.
         });
@@ -561,7 +565,7 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn wait_ready(&self) {
         for _ in 0..200 {
-            if self.inner.node.get().is_some() {
+            if self.inner.node().is_some() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -587,11 +591,15 @@ impl Drop for Engine {
 }
 
 impl Inner {
-    async fn start_node(
-        self: Arc<Self>,
-        persist_dir: PathBuf,
-        bus: Arc<dyn DeliveryBus>,
-    ) -> Result<(), String> {
+    fn node(&self) -> Option<Arc<Node>> {
+        self.node.lock().unwrap().clone()
+    }
+
+    /// Start the node for the chosen sync mode and subscribe every note.
+    async fn start_node(self: Arc<Self>) -> Result<(), String> {
+        let _switching = self.switching.lock().await;
+        let persist_dir = self.dir.clone();
+        let bus = self.bus.clone();
         std::fs::create_dir_all(&persist_dir).map_err(|e| e.to_string())?;
         let key = load_or_create_key(&persist_dir)?;
         *self.me.lock().unwrap() = Some(key.verifying_key().to_hex());
@@ -638,18 +646,51 @@ impl Inner {
         }
 
         node.set_message_budget(self.settings.lock().unwrap().budget);
-        let node = match self.node.set(node) {
-            Ok(()) => self.node.get().unwrap(),
-            Err(_) => return Err("node started twice".into()),
-        };
+        let node = Arc::new(node);
+        *self.node.lock().unwrap() = Some(node.clone());
+        *self.node_error.lock().unwrap() = None;
         info!("reflection node ready");
 
         let docs: Vec<Arc<Doc>> = self.docs.lock().unwrap().values().cloned().collect();
         for doc in docs {
-            self.subscribe(node, doc).await;
+            self.subscribe(&node, doc).await;
         }
         self.publish_to_new_network().await;
         Ok(())
+    }
+
+    /// Switch to the sync mode in the settings: close every note's subscription, stop the
+    /// node, and start one for the new mode. The notes stay; their content is in memory and in
+    /// the local snapshots.
+    async fn switch_node(self: Arc<Self>) {
+        {
+            let _switching = self.switching.lock().await;
+            if self.settings.lock().unwrap().mode() == self.running_mode.lock().unwrap().as_str() {
+                return;
+            }
+            info!("switching sync network");
+            self.save_snapshots();
+            let old = self.node.lock().unwrap().take();
+            *self.applied.lock().await = None;
+            let docs: Vec<Arc<Doc>> = self.docs.lock().unwrap().values().cloned().collect();
+            for doc in docs {
+                let stream = doc.stream.lock().unwrap().take();
+                doc.subscribing.store(false, Ordering::SeqCst);
+                if let Some(stream) = stream {
+                    if let Ok(stream) = Arc::try_unwrap(stream) {
+                        let _ = stream.unsubscribe().await;
+                    }
+                }
+            }
+            if let Some(old) = old {
+                let _ = old.shutdown().await;
+            }
+            self.bridge_states.lock().unwrap().clear();
+        }
+        if let Err(error) = self.clone().start_node().await {
+            error!("can't start the node for the new sync network: {error}");
+            *self.node_error.lock().unwrap() = Some(error);
+        }
     }
 
     /// In p2panda mode, notes this device has never published on p2panda (they were on Logos)
@@ -710,7 +751,7 @@ impl Inner {
     /// The budget, and how much of it this device has used this epoch.
     fn spend(&self) -> Spend {
         let budget = self.settings.lock().unwrap().budget;
-        let stats = self.node.get().and_then(|node| node.transport_stats());
+        let stats = self.node().and_then(|node| node.transport_stats());
         Spend {
             budget,
             used: stats
