@@ -11,6 +11,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QTimer>
+#include <QElapsedTimer>
+#include <memory>
 #include <QImage>
 #include <cstdio>
 
@@ -21,6 +23,9 @@ public:
     QMap<QString, Doc> docs;
     int calls = 0;
     int delayMs = 0;
+    bool shareCursor = false;
+    QString lastCursor;
+    QJsonArray remoteCursors;
     Q_INVOKABLE QString callModule(const QString &mod, const QString &method, const QVariant &args);
     Q_INVOKABLE void callModuleAsync(const QString &mod, const QString &method, const QVariant &args, const QJSValue &cb, int timeoutMs);
     Q_INVOKABLE void remoteSet(const QString &id, const QString &text) { auto &d = docs[id]; d.text = text; d.version++; d.name = text.section('\n', 0, 0); }
@@ -28,9 +33,11 @@ public:
     Q_INVOKABLE void setDelay(int ms) { delayMs = ms; }
 };
 
+static QJsonArray core_cursors;
 static QJsonObject detail(const QString &id, const FakeCore::Doc &d) {
     return QJsonObject{{"id", id}, {"name", d.name.isEmpty() ? "Untitled" : d.name}, {"text", d.text},
-                       {"version", QString::number(d.version)}, {"online", QJsonArray{"ab12"}}, {"subscribed", true}};
+                       {"version", QString::number(d.version)}, {"online", QJsonArray{"ab12"}}, {"subscribed", true},
+                       {"cursors", core_cursors}};
 }
 
 QString FakeCore::callModule(const QString &mod, const QString &method, const QVariant &v) {
@@ -46,6 +53,13 @@ QString FakeCore::callModule(const QString &mod, const QString &method, const QV
         r["docs"] = list; r["node"] = "ready"; r["me"] = "cafe1234";
         r["transport"] = QJsonObject{{"status", "Connected"}, {"connected", true}, {"metrics", QJsonObject{{"peers", 6}}}};
         r["current"] = docs.contains(arg(0)) ? QJsonValue(detail(arg(0), docs[arg(0)])) : QJsonValue();
+        r["settings"] = QJsonObject{{"budget", QJsonValue()}, {"shareCursor", shareCursor}};
+    } else if (method == "set_settings") {
+        QJsonObject c = QJsonDocument::fromJson(arg(0).toUtf8()).object();
+        if (c.contains("shareCursor")) shareCursor = c["shareCursor"].toBool();
+        r["settings"] = QJsonObject{{"budget", c.contains("budget") ? c["budget"] : QJsonValue()}, {"shareCursor", shareCursor}};
+    } else if (method == "set_cursor") {
+        lastCursor = arg(2) + "," + arg(3);
     } else if (method == "create_document") {
         QString id = QString("%1").arg(docs.size() + 1, 64, 10, QChar('0'));
         Doc d; d.text = arg(0).isEmpty() ? "" : arg(0) + "\n"; d.name = arg(0); docs[id] = d;
@@ -80,7 +94,8 @@ QString FakeCore::callModule(const QString &mod, const QString &method, const QV
                                       {"peers", QJsonArray{QJsonObject{{"key", "ab12cd34ef56"}, {"seconds_ago", 4}}}}});
             first = false;
         }
-        r["budget"] = 100; r["publishInterval"] = 2; r["snapshotQuiet"] = 10; r["names"] = names;
+        r["budget"] = 100; r["publishInterval"] = 1; r["cursorInterval"] = 1; r["snapshotQuiet"] = 10; r["names"] = names;
+        r["settings"] = QJsonObject{{"budget", 100}, {"shareCursor", shareCursor}};
         r["stats"] = QJsonObject{{"transport", "logos-delivery"}, {"epoch_seconds", 600}, {"epoch_elapsed", 252}, {"uptime", 1500},
                                  {"sent", counts(40, 6, 5, 2, 9)}, {"sent_this_epoch", counts(31, 4, 3, 1, 6)}, {"sent_last_epoch", counts(12, 2, 3, 0, 5)},
                                  {"received", counts(20, 3, 4, 0, 10)}, {"topics", topics}};
@@ -108,6 +123,24 @@ static QVariant js(QQuickView *v, const QString &code) {
     QVariant r = e.evaluate();
     if (e.hasError()) fprintf(stderr, "[js-err] %s: %s\n", qPrintable(code), qPrintable(e.error().toString()));
     return r;
+}
+// Check `cond` (js) until it holds or `ms` pass, then run `next`.
+static void eventually(QQuickView *v, const QString &cond, const char *what, int ms, std::function<void()> next) {
+    auto start = std::make_shared<QElapsedTimer>();
+    start->start();
+    auto tick = std::make_shared<std::function<void()>>();
+    *tick = [=]() {
+        QQmlExpression e(qmlContext(v->rootObject()), v->rootObject(), cond);
+        bool ok = e.evaluate().toBool();
+        if (ok || start->elapsed() > ms) {
+            fprintf(stderr, "%s %s (%lld ms)\n", ok ? "CHECK-OK" : "CHECK-FAIL", what, (long long)start->elapsed());
+            if (!ok) failures++;
+            next();
+        } else {
+            QTimer::singleShot(50, *tick);
+        }
+    };
+    QTimer::singleShot(0, *tick);
 }
 static void grab(QQuickView *v, const QString &path) {
     QImage img = v->grabWindow();
@@ -162,18 +195,20 @@ int main(int argc, char **argv) {
         js(&view, "joinField.text = 'nope'; joinDoc()");
     });
     at(7000, [&] {
-        check(js(&view, "notice").toString().contains("64 hex"), "a bad id shows the core's error");
+        eventually(&view, "notice.indexOf('64 hex') >= 0", "a bad id shows the core's error", 2000, [] {});
         grab(&view, out + "/04-error.png");
         js(&view, "removeDoc(); removeDoc()");
     });
     at(7600, [&] {
-        check(js(&view, "currentId").toString().isEmpty(), "remove closes the note");
+        eventually(&view, "currentId === ''", "remove closes the note", 2000, [] {});
         check(!core->docs.contains(id), "remove reaches the core");
         grab(&view, out + "/05-removed.png");
         js(&view, "newTitle.text = '# Plan'; createDoc()");
     });
-    at(8100, [&] {
-        js(&view, "editor.text = '# Plan\\n\\nSome **bold** and *italic* text, `code`, a [link](https://logos.co) and snake_case_name.\\n\\n## Tasks\\n- [x] done item\\n- [ ] open item with a long line that wraps around the edge of the editor so we can see the overlay wrap in the same place as the editor\\n1. first\\n> a quote with <html> & ampersands\\n\\n```\\nlet x = 1 < 2;\\n```\\n---\\nplain line'");
+    at(7700, [&] {
+        eventually(&view, "currentId !== '' && editor.text === '# Plan\\n'", "the # Plan note opens", 3000, [&] {
+            js(&view, "editor.text = '# Plan\\n\\nSome **bold** and *italic* text, `code`, a [link](https://logos.co) and snake_case_name.\\n\\n## Tasks\\n- [x] done item\\n- [ ] open item with a long line that wraps around the edge of the editor so we can see the overlay wrap in the same place as the editor\\n1. first\\n> a quote with <html> & ampersands\\n\\n```\\nlet x = 1 < 2;\\n```\\n---\\nplain line'");
+        });
     });
     at(8700, [&] {
         QString html = js(&view, "mdLayer.text").toString();
@@ -189,13 +224,48 @@ int main(int argc, char **argv) {
     at(9000, [&] {
         grab(&view, out + "/07-markdown-overlap.png");
         js(&view, "showStats = true");
-    });
-    at(9600, [&] {
-        check(js(&view, "stats !== null && stats.ok").toBool(), "stats panel loads the core's counters");
-        check(js(&view, "statsPanel.used").toInt() == 45, "stats panel sums this epoch's messages");
-        grab(&view, out + "/08-stats.png");
-        fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
-        QGuiApplication::exit(failures);
+        eventually(&view, "stats !== null && stats.ok === true", "stats panel loads the core's counters", 3000, [&] {
+            check(js(&view, "statsPanel.used").toInt() == 45, "stats panel sums this epoch's messages");
+            grab(&view, out + "/08-stats.png");
+            js(&view, "showStats = false; editor.color = Qt.binding(function () { return root.mdOn ? 'transparent' : root.cText })");
+            // Our own caret, visible over the coloured Markdown.
+            js(&view, "editor.forceActiveFocus(); editor.cursorPosition = 6");
+            QTimer::singleShot(300, [&] {
+                QImage img = view.grabWindow();
+                QPointF p = js(&view, "editor.mapToItem(null, editor.cursorRectangle.x + 1, editor.cursorRectangle.y + editor.cursorRectangle.height / 2)").toPointF();
+                QColor c = img.pixelColor(p.toPoint());
+                check(c.red() > 200 && c.green() < 160, "our caret is drawn (accent colour)");
+                fprintf(stderr, "[caret] at %.0f,%.0f colour %s\n", p.x(), p.y(), qPrintable(c.name()));
+                check(core->lastCursor.isEmpty(), "cursor not sent while sharing is off");
+                js(&view, "shareHover.clicked(null)");
+                eventually(&view, "settings.shareCursor === true", "share switch turns sharing on", 3000, [&] {
+                    // A poll right after must not flip it back.
+                    QTimer::singleShot(1500, [&] {
+                        check(js(&view, "settings.shareCursor").toBool(), "sharing stays on after the next polls");
+                        js(&view, "editor.cursorPosition = 8");
+                        QTimer::singleShot(1200, [&] {
+                            check(core->lastCursor == "8,8", "our cursor goes to the core once shared");
+                            fprintf(stderr, "[cursor] %s\n", qPrintable(core->lastCursor));
+                            // Someone else's cursor at offset 2 of "# Plan".
+                            core_cursors = QJsonArray{QJsonObject{{"author", "ab12cd34ef56"}, {"pos", 2}, {"anchor", 2}}};
+                            eventually(&view, "current && current.cursors && current.cursors.length === 1", "the view gets someone else's cursor", 3000, [&] {
+                                QTimer::singleShot(200, [&] {
+                                    QImage img = view.grabWindow();
+                                    QPointF p = js(&view, "var r = editor.positionToRectangle(2); editor.mapToItem(null, r.x + 1, r.y + r.height / 2)").toPointF();
+                                    QColor c = img.pixelColor(p.toPoint());
+                                    QStringList tints{"#5fb3f9", "#f97fb3", "#9be37a", "#f9c45f", "#b48cf9", "#5fe0d0"};
+                                    check(tints.contains(c.name()), "someone else's cursor is drawn in their colour");
+                                    fprintf(stderr, "[remote] at %.0f,%.0f colour %s\n", p.x(), p.y(), qPrintable(c.name()));
+                                    grab(&view, out + "/09-cursors.png");
+                                    fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
+                                    QGuiApplication::exit(failures);
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
     });
     return app.exec();
 }

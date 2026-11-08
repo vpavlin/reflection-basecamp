@@ -30,7 +30,7 @@ Item {
     readonly property color cCode: tok(pal.success, "#7fc79a")
     readonly property color cLink: "#8ab4f8"
     readonly property color cEmph: "#e9b97a"
-    readonly property string viewVersion: "0.2.0"
+    readonly property string viewVersion: "0.3.0"
 
     // Build switches. `debugTools` shows the message-stats button (how many Logos messages this
     // device sends, mapped to the RLN budget); set it to false for a build without it.
@@ -103,12 +103,15 @@ Item {
         if (root.pollBusy) { root.pollAgain = true; return }
         root.pollBusy = true
         var asked = root.currentId
+        var seq = root.settingsSeq
         root.core("state", [asked], function (raw) {
             root.pollBusy = false
             var s = root.parse(raw)
             if (s && s.ok) {
                 root.coreSeen = true
                 root.missedPolls = 0
+                // A reply to a request made before a settings change has the old settings.
+                if (seq !== root.settingsSeq) s.settings = root.st.settings
                 root.st = s
                 if (asked === root.currentId) root.mergeRemote(s.current)
             } else {
@@ -169,6 +172,7 @@ Item {
                 root.setEditor(c.text)
                 root.baseText = c.text
                 root.baseVersion = c.version
+                cursorDebounce.restart()
             } else {
                 // The user kept typing: their text builds on what was sent.
                 root.baseText = root.sentText
@@ -193,8 +197,10 @@ Item {
 
     function selectDoc(id) {
         if (id === root.currentId) return
+        var seq = root.settingsSeq
         root.core("state", [id], function (raw) {
             var s = root.parse(raw)
+            if (s && s.ok && seq !== root.settingsSeq) s.settings = root.st.settings
             if (s && s.ok && s.current) { root.st = s; root.openDoc(id, s.current) }
             else root.say("Could not open the note", true)
         })
@@ -287,6 +293,39 @@ Item {
         })
     }
     Timer { interval: 2000; running: root.showStats; repeat: true; triggeredOnStart: true; onTriggered: root.refreshStats() }
+    readonly property var settings: st.settings || ({})
+    property int settingsSeq: 0
+    function setSettings(changes, done) {
+        root.settingsSeq++
+        root.core("set_settings", [JSON.stringify(changes)], function (raw) {
+            var r = root.parse(raw)
+            if (!r) { root.say("This reflection_core can't change settings (update it)", true); return }
+            if (!r.ok) { root.say(r.error || "Could not change the setting", true); return }
+            root.settingsSeq++
+            root.st = Object.assign({}, root.st, { settings: r.settings })
+            if (done) done()
+            if (root.showStats) root.refreshStats()
+        })
+    }
+
+    // ── cursors: ours goes to the core (and on to the others if shared) once the editor's
+    // text is what the core has, so its offsets mean the same thing on both sides.
+    Timer { id: cursorDebounce; interval: 300; onTriggered: root.sendCursor() }
+    function sendCursor() {
+        if (root.currentId === "" || !root.settings.shareCursor) return
+        if (root.sending || debounce.running || editor.text !== root.baseText) { cursorDebounce.restart(); return }
+        var pos = editor.cursorPosition
+        var anchor = editor.selectionStart === editor.selectionEnd ? pos
+                   : (pos === editor.selectionStart ? editor.selectionEnd : editor.selectionStart)
+        root.core("set_cursor", [root.currentId, root.baseVersion, String(pos), String(anchor)], function () {})
+    }
+    readonly property var cursorColours: ["#5fb3f9", "#f97fb3", "#9be37a", "#f9c45f", "#b48cf9", "#5fe0d0"]
+    function colourOf(key) {
+        var h = 0
+        for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) % 9973
+        return root.cursorColours[h % root.cursorColours.length]
+    }
+
     function kb(bytes) { return bytes >= 1024 ? (Math.round(bytes / 102.4) / 10) + " KB" : bytes + " B" }
     function total(c) {
         if (!c) return 0
@@ -508,6 +547,38 @@ Item {
                         }
                     }
                 }
+                Rectangle {
+                    id: shareToggle
+                    Layout.preferredHeight: 34
+                    Layout.preferredWidth: shareRow.implicitWidth + 20
+                    radius: 17
+                    color: shareHover.containsMouse ? root.cRaised : "transparent"
+                    border.width: 1
+                    border.color: root.settings.shareCursor ? root.cAccent : root.cLine
+                    RowLayout {
+                        id: shareRow
+                        anchors.centerIn: parent
+                        spacing: 6
+                        Rectangle {
+                            width: 28; height: 16; radius: 8
+                            color: root.settings.shareCursor ? root.cAccent : root.cBg
+                            border.width: 1; border.color: root.cLine
+                            Rectangle {
+                                width: 12; height: 12; radius: 6; y: 2
+                                x: root.settings.shareCursor ? 14 : 2
+                                color: root.cText
+                            }
+                        }
+                        Text { text: "Share my cursor"; color: root.cText; font.pixelSize: 12; textFormat: Text.PlainText }
+                    }
+                    MouseArea {
+                        id: shareHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.setSettings({ shareCursor: !root.settings.shareCursor }, function () { cursorDebounce.restart() })
+                    }
+                }
                 LogosButton { text: "Copy id"; Layout.preferredWidth: 96; Layout.preferredHeight: 34; onClicked: root.copy(root.currentId) }
                 LogosButton { text: root.confirmRemove ? "Really remove?" : "Remove"; Layout.preferredWidth: 120; Layout.preferredHeight: 34; onClicked: root.removeDoc() }
             }
@@ -540,6 +611,61 @@ Item {
                         textFormat: TextEdit.PlainText
                         background: null
                         onTextChanged: if (!root.applyingRemote && root.currentId !== "") debounce.restart()
+                        onCursorPositionChanged: if (root.currentId !== "") cursorDebounce.restart()
+                        onSelectionStartChanged: if (root.currentId !== "") cursorDebounce.restart()
+
+                        // Our caret. The default one is drawn in the text colour, which is
+                        // transparent while Markdown is coloured.
+                        cursorDelegate: Rectangle {
+                            id: caret
+                            width: 2
+                            color: root.cAccent
+                            visible: editor.activeFocus && blink.on
+                            Timer {
+                                id: blink
+                                property bool on: true
+                                interval: 530
+                                repeat: true
+                                running: editor.activeFocus
+                                onTriggered: on = !on
+                                onRunningChanged: on = true
+                            }
+                            Connections {
+                                target: editor
+                                function onCursorPositionChanged() { blink.on = true; blink.restart() }
+                            }
+                        }
+
+                        // Other people's cursors (from the core, in the current text).
+                        Repeater {
+                            model: (root.current && root.current.cursors) ? root.current.cursors : []
+                            delegate: Item {
+                                id: remote
+                                required property var modelData
+                                readonly property int pos: Math.max(0, Math.min(modelData.pos, editor.length))
+                                readonly property rect r: { editor.text; editor.width; return editor.positionToRectangle(pos) }
+                                readonly property color tint: root.colourOf(modelData.author)
+                                x: r.x
+                                y: r.y
+                                z: 2
+                                Rectangle { width: 2; height: remote.r.height; color: remote.tint }
+                                Rectangle {
+                                    y: -height
+                                    width: tag.implicitWidth + 6
+                                    height: tag.implicitHeight + 2
+                                    radius: 3
+                                    color: remote.tint
+                                    Text {
+                                        id: tag
+                                        anchors.centerIn: parent
+                                        text: String(remote.modelData.author).substring(0, 6)
+                                        color: "#111"
+                                        font.pixelSize: 9
+                                        textFormat: Text.PlainText
+                                    }
+                                }
+                            }
+                        }
 
                         Text {
                             id: mdLayer
@@ -608,7 +734,8 @@ Item {
             Layout.maximumWidth: 330
             color: root.cSurface
             readonly property var s: root.stats ? root.stats.stats : null
-            readonly property int budget: root.stats ? root.stats.budget : 100
+            readonly property bool hasBudget: !!(root.stats && root.stats.budget)
+            readonly property int budget: statsPanel.hasBudget ? root.stats.budget : 0
             readonly property int used: root.total(s ? s.sent_this_epoch : null)
 
             ScrollView {
@@ -634,7 +761,7 @@ Item {
                         wrapMode: Text.Wrap
                         elide: Text.ElideNone
                         font.pixelSize: 11
-                        text: "Logos Delivery meters what a node publishes (RLN): a membership allows a number of messages per 10-minute epoch, shared by every app on the node. Receiving is free. Notes that aren't open send nothing; the open one announces itself when opened and every 2 minutes, and edits are merged."
+                        text: "Logos Delivery will meter what a node publishes (RLN): a membership allows a number of messages per 10-minute epoch, shared by every app on the node. Receiving is free. Notes that aren't open send nothing; the open one announces itself when opened and every 2 minutes, edits are merged, and your cursor is sent only if you share it."
                     }
                     RLabel { visible: root.statsError !== ""; Layout.fillWidth: true; wrapMode: Text.Wrap; color: root.cBad; text: root.statsError }
                     RLabel { visible: root.stats !== null && !statsPanel.s; Layout.fillWidth: true; wrapMode: Text.Wrap; text: "No counters yet (the engine is starting)." }
@@ -654,12 +781,13 @@ Item {
                             }
                         }
                         Text {
-                            text: statsPanel.used + " of " + statsPanel.budget + " messages"
-                            color: statsPanel.used * 10 >= statsPanel.budget * 8 ? root.cBad : (statsPanel.used * 2 >= statsPanel.budget ? root.cAccent : root.cText)
+                            text: statsPanel.used + (statsPanel.hasBudget ? (" of " + statsPanel.budget) : "") + " messages"
+                            color: !statsPanel.hasBudget ? root.cText : (statsPanel.used * 10 >= statsPanel.budget * 8 ? root.cBad : (statsPanel.used * 2 >= statsPanel.budget ? root.cAccent : root.cText))
                             font.pixelSize: 22
                             textFormat: Text.PlainText
                         }
                         Rectangle {
+                            visible: statsPanel.hasBudget
                             Layout.fillWidth: true
                             Layout.preferredHeight: 6
                             radius: 3
@@ -676,13 +804,49 @@ Item {
                             wrapMode: Text.Wrap
                             elide: Text.ElideNone
                             font.pixelSize: 11
-                            text: root.stats ? ("Budget assumed: " + root.stats.budget + " per epoch (the smallest membership). Edits now go out at most every "
-                                                + root.stats.publishInterval + " s; a snapshot follows " + root.stats.snapshotQuiet + " s after you stop typing.") : ""
+                            text: {
+                                if (!root.stats) return ""
+                                var t = "Edits now go out at most every " + (Math.round(root.stats.publishInterval * 10) / 10) + " s"
+                                t += root.stats.cursorInterval === null ? ", your cursor not at all (budget short)" : (", your cursor every " + (Math.round(root.stats.cursorInterval * 10) / 10) + " s if shared")
+                                t += "; a snapshot follows " + root.stats.snapshotQuiet + " s after you stop typing."
+                                var b = statsPanel.s ? statsPanel.s.sent_this_epoch.blocked : 0
+                                if (b > 0) t += " " + b + " messages were held back this epoch (over the budget)."
+                                return t
+                            }
                         }
                         RLabel {
                             Layout.fillWidth: true
                             font.pixelSize: 11
                             text: statsPanel.s ? ("Last epoch: " + root.total(statsPanel.s.sent_last_epoch) + " messages") : ""
+                        }
+
+                        // pretend budget, to try out RLN tiers
+                        RLabel { Layout.fillWidth: true; Layout.topMargin: 4; text: "Pretend RLN limit (messages per epoch)"; color: root.cText }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            RField {
+                                id: budgetField
+                                placeholderText: "no limit"
+                                text: root.settings.budget ? String(root.settings.budget) : ""
+                                inputMethodHints: Qt.ImhDigitsOnly
+                                validator: RegularExpressionValidator { regularExpression: /[0-9]{0,6}/ }
+                                onAccepted: root.setSettings({ budget: budgetField.text.trim() === "" ? null : budgetField.text.trim() })
+                            }
+                            LogosButton {
+                                text: "Set"
+                                Layout.preferredWidth: 56
+                                Layout.preferredHeight: 30
+                                onClicked: root.setSettings({ budget: budgetField.text.trim() === "" ? null : budgetField.text.trim() })
+                            }
+                        }
+                        RLabel {
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            elide: Text.ElideNone
+                            font.pixelSize: 10
+                            color: root.cFaint
+                            text: "Not enforced by the network yet. Past the limit nothing more is sent this epoch (as RLN would drop it); edits slow down from half of it. Empty: no limit."
                         }
                     }
 
@@ -700,7 +864,8 @@ Item {
                         Repeater {
                             model: [
                                 ["ops", "Edits (merged)"], ["snapshots", "Snapshots"], ["heads", "Catch-up requests"],
-                                ["repairs", "Catch-up answers"], ["presence", "Presence"], ["cursors", "Cursors"], ["relayed", "Relayed (bridge)"]
+                                ["repairs", "Catch-up answers"], ["presence", "Presence"], ["cursors", "Cursors"], ["relayed", "Relayed (bridge)"],
+                                ["blocked", "Held back (over limit)"]
                             ]
                             delegate: RLabel {
                                 required property var modelData
@@ -712,7 +877,7 @@ Item {
                             }
                         }
                         Repeater {
-                            model: ["ops", "snapshots", "heads", "repairs", "presence", "cursors", "relayed"]
+                            model: ["ops", "snapshots", "heads", "repairs", "presence", "cursors", "relayed", "blocked"]
                             delegate: RLabel {
                                 required property var modelData
                                 required property int index
@@ -721,11 +886,11 @@ Item {
                                 Layout.preferredWidth: 50
                                 horizontalAlignment: Text.AlignRight
                                 color: root.cText
-                                text: statsPanel.s ? String(statsPanel.s.sent_this_epoch[modelData]) : ""
+                                text: statsPanel.s ? String(statsPanel.s.sent_this_epoch[modelData] || 0) : ""
                             }
                         }
                         Repeater {
-                            model: ["ops", "snapshots", "heads", "repairs", "presence", "cursors", "relayed"]
+                            model: ["ops", "snapshots", "heads", "repairs", "presence", "cursors", "relayed", "blocked"]
                             delegate: RLabel {
                                 required property var modelData
                                 required property int index
@@ -733,7 +898,7 @@ Item {
                                 Layout.column: 2
                                 Layout.preferredWidth: 50
                                 horizontalAlignment: Text.AlignRight
-                                text: statsPanel.s ? String(statsPanel.s.sent[modelData]) : ""
+                                text: statsPanel.s ? String(statsPanel.s.sent[modelData] || 0) : ""
                             }
                         }
                     }
