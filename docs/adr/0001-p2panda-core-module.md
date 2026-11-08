@@ -55,15 +55,32 @@ The module never creates, stores or chooses a signing key. Two ways to write:
 - **App-signed** (`import`): the app builds and signs the p2panda operation itself and hands the
   module the header and body. The module validates and ingests it (`StreamPublisher::import`) and
   syncs it. For apps that link `p2panda-core`.
-- **Signed with the app's key** (`publish`, `prune`, `ephemeral`): the app passes its signing key
-  (hex) with the call; the module builds the operation (log, seq, backlink, prune flag), signs it
-  with that key, ingests it and forgets the key. For apps that don't want p2panda's encoding in
-  their own code. The key crosses Basecamp IPC on the device, as the app's other data does.
+- **Signed through a session** (`publish`, `prune`, `ephemeral`): the app hands its key over once,
+  `signer_open(app, key)`, and gets back an unguessable 128-bit handle; writes then carry the
+  handle, and the module builds the operation (log, seq, backlink, prune flag) and signs it. The
+  key lives only in the module's memory (zeroized when dropped), is never written anywhere, and is
+  dropped on `signer_close`, when the app closes its last topic, and on module restart (apps open
+  a new session after `restarted`). The handle is a return value, which reaches only the caller,
+  unlike events, so other modules can't learn it. For apps that don't want p2panda's encoding in
+  their own code.
 
-`import` is the recommended path; `publish(key)` is the convenience path, because a private key
-crossing IPC on every write is exposed to logs, crash dumps and tools like `logosctl watch`. The
-module never logs method arguments (keys, bodies, topic ids), keeps keys out of error messages,
-and zeroizes a key once the operation is signed.
+Compared with module-held keys under an unauthenticated `app` label, where any module could
+`publish(app="reflection")` and forge the user's edits, a hostile module here can't sign as the
+user without the key or the handle. Compared with passing the key on every write, the key crosses
+IPC once per session instead of with every keystroke.
+
+Apps should give the module as little as possible: a key derived per document from their root
+key, rather than the root key that is the user's identity everywhere, so a leaked key affects one
+document. (For Reflection this is a decision of its own: the GTK app uses one identity across
+documents, and presence shows it.)
+
+`import` is the recommended path: no key crosses IPC. The signer session is the convenience path,
+because a key that crosses IPC passes through QString/QVariant buffers in both processes (which
+can't be zeroized), the Qt Remote Objects socket, `logos_host` and the generated LIDL glue, and is
+visible to `logosctl call/watch` and crash dumps. Rules: key and body arguments are never logged
+at any level (the generated glue and `logos_host` trace paths are audited, not just this module),
+errors never echo arguments, Rust-side copies are zeroized, and a write that names an author is
+refused if the session's key belongs to someone else (to catch app bugs, not as security).
 
 For `import`, the app needs to know where its log stands: `head` gives the latest operation of an
 author's log as the module has it (after a restart, or when the same key also wrote through
@@ -87,10 +104,12 @@ standard base64. `network` is the 32-byte network id (hex), `topic` the 32-byte 
 | `forget(app, network, topic)` | The user deleted the document: close it, delete its stored operations and its bridge state. Refused while another app has it open. |
 | `head(network, topic, author)` | The latest operation (seq, hash) of an author's log, or none. |
 | `heads(network, topic)` | The same for every author of the topic. |
-| `publish(app, network, topic, key, body_b64)` | Append an operation with this body to the log of `key`'s author, signed with `key` (not kept). Returns the operation hash and seq. |
-| `prune(app, network, topic, key, body_b64)` | The same with the prune flag (a snapshot; earlier operations of that log may be deleted everywhere). |
+| `signer_open(app, key)` | Start a signing session with this key (hex); returns a handle and the author's public key. |
+| `signer_close(signer)` | End it; the key is dropped. |
+| `publish(app, network, topic, signer, body_b64)` | Append an operation with this body to the session author's log, signed by the session. Returns the operation hash and seq. |
+| `prune(app, network, topic, signer, body_b64)` | The same with the prune flag (a snapshot; earlier operations of that log may be deleted everywhere). |
 | `import(app, network, topic, header_b64, body_b64)` | Ingest an operation the app signed. Refused if invalid or not for this topic's log. |
-| `ephemeral(app, network, topic, key, body_b64)` | Send an ephemeral message (presence, cursors), signed with `key` (not kept). |
+| `ephemeral(app, network, topic, signer, body_b64)` | Send an ephemeral message (presence, cursors), signed by the session. |
 | `set_active(app, network, topic, active)` | Whether the user has the topic open (used by the bridge, section 4). A **lease**: it expires after 60 s unless renewed, so a crashed app can't leave a topic active. A topic is active while any app holds a lease on it. |
 | `bridge(app, network, topic, on)` | `on`: **ask** to carry this topic over Logos Delivery as well; it stays `pending` until the user confirms it in the p2panda view (section 4). `off`: stop bridging, at once. |
 | `status()` | Per network: node up, iroh relay/direct connections, peers per topic, sync sessions. |
@@ -210,6 +229,9 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
 - **Per-app limits:** topics open (default 200), bridged topics (20), queue size (above).
 - **`pending` is broadcast** with the app label and a count: other modules can see that an app has
   traffic, not what. Apps drain until the queue is empty, not once per event.
+- **Residual risk.** Anything that can read the user's process memory or the IPC socket gets a
+  signing key in a session as it would in any design where another process signs. Only `import`
+  (the app signs, possibly through the OS keyring) avoids that.
 - **Shared node, separate subscriptions.** Apps on the same network id share its node and store;
   each app only receives topics it opened. An app that knows another app's topic id can open it,
   as anyone on the network can: topic ids are the secret.
@@ -244,8 +266,10 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
 
 ## Decisions on the open questions (owner, 2026-11-08)
 
-1. **Keys: apps control them.** No module-held keys (section 2): apps import operations they
-   signed, or pass their key with each write and the module forgets it.
+1. **Keys: apps control them.** The module never stores or chooses a key (section 2): apps import
+   operations they signed (recommended), or open a signing session (the key crosses IPC once and
+   lives only in memory until the session ends). Review: a session handle instead of the key on
+   every write.
 2. **One module, one node per network id inside it** (section 1). Users see no difference; one
    module is simpler to run and to show status for.
 3. **Replay and live data reach each app through its own queue** (sections 3 and 6). The owner
@@ -282,6 +306,7 @@ view; `head`/`heads` and per-author write serialization for `import`; cursors an
 at-least-once guarantee instead of full replays; keys by `(app, network, topic)`; the at-least-one
 rule for `drain`; distinct labels per app instance; `forget`; `set_active` leases; `pending`
 metadata stated; size check for bridged topics; no logging of arguments and key zeroizing;
-`import` as the recommended path; an iroh key per network id; one device-wide budget in
+`import` as the recommended path and signer sessions instead of per-call keys; per-document keys
+recommended; the residual risk stated; an iroh key per network id; one device-wide budget in
 `loam_core`; the patch pinned and guarded; the extra tests. The question whether discovery leaks
 topic ids was answered from p2panda's source (section 4): it doesn't.
