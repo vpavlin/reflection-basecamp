@@ -49,6 +49,18 @@ budget, by kind, and per note. It is a debug tool: set `debugTools` to `false` i
 The editor colours Markdown syntax (headings, emphasis, code, links, lists, quotes). The text
 itself stays plain, as in the GTK app.
 
+## p2panda and the bridge (0.4)
+
+`p2panda_core` is a shared p2panda node for Basecamp apps, one per app network, and the `p2panda`
+app is its view ([ADR 0001](docs/adr/0001-p2panda-core-module.md)). Reflection can sync through
+it instead of Logos Delivery: *Message stats > Sync network > p2panda*, then restart Basecamp. It
+is then on the same network as upstream Reflection (the GTK app from Flathub).
+
+In p2panda mode each note has an **Also on Logos** switch: it asks `p2panda_core` to bridge the
+note to Logos Delivery, so Reflection users on Logos see it too. Nothing is bridged until you
+approve it in the p2panda app (Allow / Refuse / Stop), because the bridge spends this device's
+Logos messages.
+
 ## Building
 
 ```sh

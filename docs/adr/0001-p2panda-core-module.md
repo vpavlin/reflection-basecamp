@@ -338,3 +338,32 @@ metadata stated; size check for bridged topics; no logging of arguments and key 
 recommended; the residual risk stated; an iroh key per network id; one device-wide budget in
 `loam_core`; the patch pinned and guarded; the extra tests. The question whether discovery leaks
 topic ids was answered from p2panda's source (section 4): it doesn't.
+
+## Implementation notes (0.1.0, 2026-11-08)
+
+What was built differs from the text above in these points:
+
+- **The signer session is the network.** A p2panda node's key is both its iroh identity and the
+  author of everything it signs (operations and ephemeral messages). So an app opens a network
+  with its key (`network_open(app, network, key)`), the module keeps it in memory for that node,
+  and writes are signed with it; there is no separate `signer_open`. A second app on the same
+  network must bring the same key. `import` (operations signed elsewhere) is used by the bridge
+  only so far. Reflection opens its network with its identity, as the GTK app does.
+- **Subscriptions are p2panda streams**: each one replays from the store (`from`: `start` or
+  `frontier`) and then goes live; a full subscription stops reading its stream (nothing is
+  lost). Imported Logos operations are handed to the topic's subscriptions by the bridge, and an
+  app's own new operations go straight to the bridge, because p2panda shows a stream's publishes
+  and imports only to that stream.
+- **Only Reflection's network reaches the public bootstrap node.** p2panda puts the network id
+  in its protocol identifier, and the public bootstrap node serves `reflection-v2`; a node on
+  another network id finds peers only locally (or through its own bootstrap node, not
+  configurable yet).
+- **Reflection's sync mode** (`logos` or `p2panda`) is a setting applied when Reflection starts.
+  Notes keep a local snapshot, and are published once as a snapshot when they first meet the
+  p2panda network, so their content follows the switch.
+- **The p2panda view** is the separate package `p2panda` (`p2panda_ui/`).
+- Tested: engine tests in-process (two devices, bridge pending until confirmed, both ways
+  including a live edit); two `logosctl` sessions over the real p2panda network (an edit arrived
+  in about 4 s) and a confirmed bridge relaying through `loam_core`; upstream Reflection's tests
+  through the external backend (`REFLECTION_BACKEND=p2panda-external`).
+
