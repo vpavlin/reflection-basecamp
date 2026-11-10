@@ -9,7 +9,9 @@ use tracing::{error, info, warn};
 
 use crate::engine::{Emit, Engine, Event, Options, API_VERSION};
 use crate::loam::{self, LoamApi, LoamBus};
-use crate::{emit_pending, emit_restarted, loam_core, modules, P2pandaCoreModule, RustModuleContext};
+use crate::{
+    emit_pending, emit_restarted, loam_core, modules, P2pandaCoreModule, RustModuleContext,
+};
 
 /// Module calls made while the host is still setting the module up are refused.
 const STARTUP_DELAY: Duration = Duration::from_millis(1500);
@@ -52,7 +54,14 @@ impl P2pandaCoreModule for Core {
         self.with_engine(|e| e.network_open(&app, &network, &key))
     }
 
-    fn open(&mut self, app: String, network: String, topic: String, from: String, label: String) -> String {
+    fn open(
+        &mut self,
+        app: String,
+        network: String,
+        topic: String,
+        from: String,
+        label: String,
+    ) -> String {
         self.with_engine(|e| e.open(&app, &network, &topic, &from, &label))
     }
 
@@ -67,6 +76,10 @@ impl P2pandaCoreModule for Core {
 
     fn publish(&mut self, sub: String, message: String, prune: String) -> String {
         self.with_engine(|e| e.publish(&sub, &message, flag(&prune)))
+    }
+
+    fn import(&mut self, sub: String, header: String, body: String) -> String {
+        self.with_engine(|e| e.import(&sub, &header, &body))
     }
 
     fn ephemeral(&mut self, sub: String, message: String) -> String {
@@ -113,7 +126,12 @@ impl P2pandaCoreModule for Core {
             Event::Pending(tag) => emit_pending(&tag),
         });
         let (bus, commands) = LoamBus::new();
-        let engine = Arc::new(Engine::start(persist, bus.clone(), Options::default(), emit));
+        let engine = Arc::new(Engine::start(
+            persist,
+            bus.clone(),
+            Options::default(),
+            emit,
+        ));
         self.engine = Some(engine);
 
         let spawned = std::thread::Builder::new()
@@ -204,8 +222,10 @@ impl LoamApi for GeneratedLoam {
 }
 
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("P2PANDA_CORE_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("p2panda_core=info,logos_p2panda=info,p2panda=warn"));
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_env("P2PANDA_CORE_LOG").unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("p2panda_core=info,logos_p2panda=info,p2panda=warn")
+        });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

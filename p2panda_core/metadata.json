@@ -1,7 +1,7 @@
 {
   "name": "p2panda_core",
   "display_name": "p2panda Core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "core",
   "interface": "cdylib",
   "category": "network",

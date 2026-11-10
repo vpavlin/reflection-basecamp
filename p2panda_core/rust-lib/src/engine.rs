@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use ciborium::Value as Cbor;
 use logos_p2panda::{Config as LogosConfig, DeliveryBus, LogosSync, Op};
-use p2panda::streams::{
-    EphemeralStreamPublisher, StreamEvent, StreamFrom, StreamPublisher,
-};
+use p2panda::streams::{EphemeralStreamPublisher, StreamEvent, StreamFrom, StreamPublisher};
 use p2panda::{NetworkId, Topic};
 use p2panda_core::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -28,7 +26,8 @@ use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
-pub const API_VERSION: u64 = 1;
+/// 2: operation items carry the signed operation (`header`, `body`), and `import`.
+pub const API_VERSION: u64 = 2;
 
 /// Items a subscription may hold before the module stops reading ahead for it.
 const MAX_QUEUED_OPS: usize = 4096;
@@ -119,6 +118,9 @@ struct Sub {
     topic: Topic,
     publisher: StreamPublisher<Cbor>,
     ephemeral: EphemeralStreamPublisher<Cbor>,
+    /// Operations from elsewhere to import into the topic (`import`), started on first use.
+    imports:
+        tokio::sync::OnceCell<tokio::sync::mpsc::UnboundedSender<p2panda::operation::Operation>>,
     queue: Mutex<Queue>,
     space: Notify,
     active_until: Mutex<Option<Instant>>,
@@ -139,7 +141,9 @@ impl Queue {
     }
 
     fn abandoned(&self) -> bool {
-        self.last_drain.or(self.created).is_some_and(|at| at.elapsed() > ABANDONED_AFTER)
+        self.last_drain
+            .or(self.created)
+            .is_some_and(|at| at.elapsed() > ABANDONED_AFTER)
     }
 }
 
@@ -165,8 +169,8 @@ fn bridge_key(network: &str, topic: &str) -> String {
 }
 
 fn parse32(what: &str, hex_str: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_str.trim().trim_matches('"'))
-        .map_err(|_| format!("{what} is not hex"))?;
+    let bytes =
+        hex::decode(hex_str.trim().trim_matches('"')).map_err(|_| format!("{what} is not hex"))?;
     bytes
         .try_into()
         .map_err(|_| format!("{what} must be 32 bytes (64 hex characters)"))
@@ -263,7 +267,8 @@ impl Engine {
             .collect();
         for topic in confirmed {
             if let Ok(bytes) = parse32("topic", &topic) {
-                self.inner.start_bridge(&network, Topic::from(bytes), &self.rt);
+                self.inner
+                    .start_bridge(&network, Topic::from(bytes), &self.rt);
             }
         }
         Ok(json!({ "ok": true, "author": network.key.verifying_key().to_hex() }))
@@ -307,7 +312,8 @@ impl Engine {
             task.abort();
         }
         let inner = self.inner.clone();
-        self.rt.spawn(async move { inner.update_activity(&sub.network, sub.topic).await });
+        self.rt
+            .spawn(async move { inner.update_activity(&sub.network, sub.topic).await });
         Ok(json!({ "ok": true }))
     }
 
@@ -373,6 +379,43 @@ impl Engine {
         Ok(json!({ "ok": true, "hash": hash.to_hex() }))
     }
 
+    /// Import a signed operation from elsewhere (another network) into the topic: p2panda checks
+    /// and stores it, syncs it to peers and delivers it to the subscription like any other
+    /// (`source` "logos"). `header_b64` / `body_b64`: as encoded on the wire (`body_b64` empty
+    /// for none). Returns once queued; an invalid operation is dropped by p2panda.
+    pub fn import(&self, sub: &str, header_b64: &str, body_b64: &str) -> Result<Value, String> {
+        let sub = self.sub(sub)?;
+        let header: p2panda::operation::Header =
+            p2panda_core::cbor::decode_cbor(&unb64(header_b64)?[..])
+                .map_err(|e| format!("bad header: {e}"))?;
+        let body = match body_b64.trim().trim_matches('"') {
+            "" => None,
+            b => Some(unb64(b)?),
+        };
+        let op = Op::from_parts(header, body);
+        if !op.validate() {
+            return Err("invalid operation".into());
+        }
+        let operation = op.to_operation();
+        let hash = operation.hash;
+        let tx = self.rt.block_on(async {
+            sub.imports
+                .get_or_try_init(|| async {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    sub.publisher
+                        .import(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>(tx)
+                })
+                .await
+                .cloned()
+        })?;
+        tx.send(operation)
+            .map_err(|_| "import stopped".to_owned())?;
+        Ok(json!({ "ok": true, "hash": hash.to_hex() }))
+    }
+
     /// Send an ephemeral message (presence, cursors).
     pub fn ephemeral(&self, sub: &str, message_b64: &str) -> Result<Value, String> {
         let sub = self.sub(sub)?;
@@ -391,7 +434,8 @@ impl Engine {
         let sub = self.sub(sub)?;
         *sub.active_until.lock().unwrap() = active.then(|| Instant::now() + ACTIVE_LEASE);
         let inner = self.inner.clone();
-        self.rt.spawn(async move { inner.update_activity(&sub.network, sub.topic).await });
+        self.rt
+            .spawn(async move { inner.update_activity(&sub.network, sub.topic).await });
         Ok(json!({ "ok": true }))
     }
 
@@ -402,16 +446,13 @@ impl Engine {
         let key = bridge_key(&sub.network.hex, &hex::encode(sub.topic.to_bytes()));
         let state = if on {
             let mut bridges = self.inner.bridges.lock().unwrap();
-            let entry = bridges
-                .topics
-                .entry(key)
-                .or_insert_with(|| BridgeEntry {
-                    network: sub.network.hex.clone(),
-                    topic: hex::encode(sub.topic.to_bytes()),
-                    app: sub.app.clone(),
-                    label: sub.label.lock().unwrap().clone(),
-                    state: "pending".into(),
-                });
+            let entry = bridges.topics.entry(key).or_insert_with(|| BridgeEntry {
+                network: sub.network.hex.clone(),
+                topic: hex::encode(sub.topic.to_bytes()),
+                app: sub.app.clone(),
+                label: sub.label.lock().unwrap().clone(),
+                state: "pending".into(),
+            });
             entry.state.clone()
         } else {
             self.inner.bridges.lock().unwrap().topics.remove(&key);
@@ -430,11 +471,21 @@ impl Engine {
         if on {
             {
                 let mut bridges = self.inner.bridges.lock().unwrap();
-                let entry = bridges.topics.get_mut(&key).ok_or("no such bridge request")?;
+                let entry = bridges
+                    .topics
+                    .get_mut(&key)
+                    .ok_or("no such bridge request")?;
                 entry.state = "on".into();
             }
             self.inner.save_bridges();
-            if let Some(network) = self.inner.networks.lock().unwrap().get(&network_hex).cloned() {
+            if let Some(network) = self
+                .inner
+                .networks
+                .lock()
+                .unwrap()
+                .get(&network_hex)
+                .cloned()
+            {
                 let topic = Topic::from(parse32("topic", &topic_hex)?);
                 self.inner.start_bridge(&network, topic, &self.rt);
             }
@@ -457,8 +508,14 @@ impl Engine {
 
     /// Pretend RLN budget for the bridge's Logos side (per network; `None`: no limit).
     pub fn set_message_budget(&self, budget: Option<u64>) {
-        let networks: Vec<Arc<Network>> =
-            self.inner.networks.lock().unwrap().values().cloned().collect();
+        let networks: Vec<Arc<Network>> = self
+            .inner
+            .networks
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         for network in networks {
             if let Some(logos) = network.logos.get() {
                 logos.set_message_budget(budget);
@@ -531,7 +588,9 @@ impl Drop for Engine {
     fn drop(&mut self) {
         let rt = std::mem::replace(
             &mut self.rt,
-            tokio::runtime::Builder::new_current_thread().build().unwrap(),
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
         );
         rt.shutdown_background();
     }
@@ -579,6 +638,9 @@ where
         "timestamp": operation.timestamp(),
         "message": b64(&cbor_encode(operation.message())),
         "source": source,
+        // The signed operation as encoded on the wire, to pass it on unchanged (API 2).
+        "header": b64(&header.to_bytes()),
+        "body": processed.body().map(|body| b64(&body.to_bytes())),
     })
 }
 
@@ -600,8 +662,9 @@ impl Inner {
             .database_pool(pool.clone());
         if !self.options.local {
             let relay: p2panda::RelayUrl = RELAY_URL.parse().map_err(|_| "bad relay url")?;
-            let bootstrap: p2panda::VerifyingKey =
-                BOOTSTRAP_NODE_ID.parse().map_err(|_| "bad bootstrap node id")?;
+            let bootstrap: p2panda::VerifyingKey = BOOTSTRAP_NODE_ID
+                .parse()
+                .map_err(|_| "bad bootstrap node id")?;
             builder = builder.bootstrap(bootstrap, relay.clone()).relay_url(relay);
         }
         let node = builder.spawn().await.map_err(|e| e.to_string())?;
@@ -647,6 +710,7 @@ impl Inner {
             topic,
             publisher,
             ephemeral,
+            imports: tokio::sync::OnceCell::new(),
             queue: Mutex::new(Queue {
                 created: Some(Instant::now()),
                 ..Queue::default()
@@ -740,7 +804,10 @@ impl Inner {
             .lock()
             .unwrap()
             .extend([ops_task.abort_handle(), eph_task.abort_handle()]);
-        self.subs.lock().unwrap().insert(sub.handle.clone(), sub.clone());
+        self.subs
+            .lock()
+            .unwrap()
+            .insert(sub.handle.clone(), sub.clone());
         Ok(sub)
     }
 
@@ -753,7 +820,9 @@ impl Inner {
                 let queue = sub.queue.lock().unwrap();
                 !queue.is_empty()
                     && !queue.abandoned()
-                    && queue.last_drain.is_none_or(|at| at.elapsed() > Duration::from_secs(1))
+                    && queue
+                        .last_drain
+                        .is_none_or(|at| at.elapsed() > Duration::from_secs(1))
             };
             if remind {
                 (self.emit)(Event::Pending(sub.tag.clone()));
@@ -776,7 +845,10 @@ impl Inner {
         let active = self.subs.lock().unwrap().values().any(|s| {
             Arc::ptr_eq(&s.network, network)
                 && s.topic == topic
-                && s.active_until.lock().unwrap().is_some_and(|t| t > Instant::now())
+                && s.active_until
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| t > Instant::now())
         });
         if let Some(logos) = network.logos.get() {
             if network.bridged.lock().unwrap().contains_key(&topic) {

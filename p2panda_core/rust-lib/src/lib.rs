@@ -20,7 +20,14 @@ pub trait P2pandaCoreModule: Send + 'static {
     /// Subscribe to a topic of an open network. `from`: "start" or "frontier". Returns a
     /// subscription handle (secret: it reaches only the caller) and a public `tag` used in
     /// `pending` events. `label` names the topic in the p2panda view.
-    fn open(&mut self, app: String, network: String, topic: String, from: String, label: String) -> String;
+    fn open(
+        &mut self,
+        app: String,
+        network: String,
+        topic: String,
+        from: String,
+        label: String,
+    ) -> String;
 
     /// End a subscription.
     fn close(&mut self, sub: String) -> String;
@@ -31,6 +38,10 @@ pub trait P2pandaCoreModule: Send + 'static {
     /// Append a message (base64 of its CBOR) to the topic, signed with the network's key.
     /// `prune` "true": a snapshot; earlier operations of the log may be deleted everywhere.
     fn publish(&mut self, sub: String, message: String, prune: String) -> String;
+
+    /// Import a signed operation from another network (base64 of its encoded header and body,
+    /// body "" for none) into the subscription's topic. API 2.
+    fn import(&mut self, sub: String, header: String, body: String) -> String;
 
     /// Send an ephemeral message (base64 of its CBOR): presence, cursors.
     fn ephemeral(&mut self, sub: String, message: String) -> String;
@@ -65,7 +76,10 @@ pub trait P2pandaCoreModuleEvents {
 }
 
 #[cfg(not(test))]
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/provider_gen.rs"
+));
 
 #[cfg(not(test))]
 mod loam;

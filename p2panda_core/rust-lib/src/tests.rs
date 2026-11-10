@@ -111,7 +111,9 @@ fn two_devices_share_a_topic() {
 
     a.publish(&sub_a, &message("hello from a"), false).unwrap();
     let items = wait_for(&b, &sub_b, "hello from a");
-    assert!(items.iter().any(|i| i["kind"] == "operation" && i["seq"] == 0));
+    assert!(items
+        .iter()
+        .any(|i| i["kind"] == "operation" && i["seq"] == 0));
 
     // A's own operation is delivered to A too, and A was told to drain.
     wait_for(&a, &sub_a, "hello from a");
@@ -133,7 +135,9 @@ fn bridge_needs_the_users_confirmation_and_then_carries_both_ways() {
     let a = device("bridge", Arc::new(Mutex::new(Vec::new())));
     let (network, topic) = (random32(), random32());
     a.network_open("test", &network, &key()).unwrap();
-    let sub = a.open("test", &network, &topic, "start", "Shopping").unwrap()["sub"]
+    let sub = a
+        .open("test", &network, &topic, "start", "Shopping")
+        .unwrap()["sub"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -168,9 +172,13 @@ fn bridge_needs_the_users_confirmation_and_then_carries_both_ways() {
 
     // An app's request alone bridges nothing.
     assert_eq!(a.bridge(&sub, true).unwrap()["state"], "pending");
-    a.publish(&sub, &message("before confirming"), false).unwrap();
+    a.publish(&sub, &message("before confirming"), false)
+        .unwrap();
     std::thread::sleep(Duration::from_secs(2));
-    assert!(from_bridge.try_recv().is_err(), "bridged before the user confirmed");
+    assert!(
+        from_bridge.try_recv().is_err(),
+        "bridged before the user confirmed"
+    );
     assert_eq!(a.bridges()["bridges"][0]["label"], "Shopping");
 
     // The user confirms: what A has goes to Logos, and Logos edits come to A.
@@ -189,7 +197,8 @@ fn bridge_needs_the_users_confirmation_and_then_carries_both_ways() {
     wait_for(&a, &sub, "from logos");
 
     // A new edit on A, after the bridge started, reaches Logos too.
-    a.publish(&sub, &message("after confirming"), false).unwrap();
+    a.publish(&sub, &message("after confirming"), false)
+        .unwrap();
     let mut want = Vec::new();
     ciborium::into_writer(&Cbor::Bytes(b"after confirming".to_vec()), &mut want).unwrap();
     let found = rt.block_on(async {
@@ -205,4 +214,51 @@ fn bridge_needs_the_users_confirmation_and_then_carries_both_ways() {
         .unwrap_or(false)
     });
     assert!(found, "a live edit was not relayed to Logos");
+}
+
+/// API 2: an operation item carries the signed operation, and another node that never synced
+/// with its author can import it unchanged (same hash), as reflection_core does with operations
+/// from Logos Delivery.
+#[test]
+fn imported_operation_is_the_same_operation() {
+    let a = device("import-a", Arc::new(Mutex::new(Vec::new())));
+    let c = device("import-c", Arc::new(Mutex::new(Vec::new())));
+    let topic = random32();
+    // Different networks: a and c never sync with each other.
+    let (net_a, net_c) = (random32(), random32());
+    a.network_open("test", &net_a, &key()).unwrap();
+    c.network_open("test", &net_c, &key()).unwrap();
+    let sub_a = a.open("test", &net_a, &topic, "start", "note").unwrap()["sub"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sub_c = c.open("test", &net_c, &topic, "start", "note").unwrap()["sub"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    a.publish(&sub_a, &message("carried over"), false).unwrap();
+    let items = wait_for(&a, &sub_a, "carried over");
+    let op = items
+        .iter()
+        .find(|i| i["kind"] == "operation" && text_of(i).as_deref() == Some("carried over"))
+        .unwrap();
+    let body = op["body"].as_str().unwrap_or("");
+    let reply = c
+        .import(&sub_c, op["header"].as_str().unwrap(), body)
+        .unwrap();
+    assert_eq!(reply["hash"], op["hash"]);
+
+    let got = wait_for(&c, &sub_c, "carried over");
+    let imported = got
+        .iter()
+        .find(|i| i["kind"] == "operation" && text_of(i).as_deref() == Some("carried over"))
+        .unwrap();
+    assert_eq!(imported["hash"], op["hash"]);
+    assert_eq!(imported["author"], op["author"]);
+    assert_eq!(imported["source"], "logos");
+    assert_eq!(imported["header"], op["header"]);
+
+    // Garbage is refused.
+    assert!(c.import(&sub_c, "AAAA", "").is_err());
 }
