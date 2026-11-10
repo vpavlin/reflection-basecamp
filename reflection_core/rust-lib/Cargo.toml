@@ -18,7 +18,7 @@ crate-type = ["staticlib"]
 [dependencies]
 # Staged by the builder from the same logos-rust-sdk revision as its code generator.
 logos-rust-sdk = { path = "../logos-rust-sdk-src" }
-reflection-node = { git = "https://github.com/vpavlin/reflection", rev = "29dcf60567ed1cbe5e84c37a645c852d38f6586e", features = ["logos"] }
+reflection-node = { git = "https://github.com/vpavlin/reflection", rev = "cff95b5c6ee771b504e714e9c12eaf07e62fa99e", features = ["logos"] }
 p2panda = "0.7.0"
 p2panda-core = "0.7.0"
 # Same Loro as reflection-doc, so documents interoperate with the GTK app.

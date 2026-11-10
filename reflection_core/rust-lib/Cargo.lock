@@ -807,7 +807,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.118",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2651,7 +2651,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 [[package]]
 name = "logos-p2panda"
 version = "0.1.0"
-source = "git+https://github.com/vpavlin/reflection?rev=29dcf60567ed1cbe5e84c37a645c852d38f6586e#29dcf60567ed1cbe5e84c37a645c852d38f6586e"
+source = "git+https://github.com/vpavlin/reflection?rev=cff95b5c6ee771b504e714e9c12eaf07e62fa99e#cff95b5c6ee771b504e714e9c12eaf07e62fa99e"
 dependencies = [
  "chacha20poly1305",
  "hex",
@@ -4220,7 +4220,7 @@ dependencies = [
 [[package]]
 name = "reflection-node"
 version = "0.5.0"
-source = "git+https://github.com/vpavlin/reflection?rev=29dcf60567ed1cbe5e84c37a645c852d38f6586e#29dcf60567ed1cbe5e84c37a645c852d38f6586e"
+source = "git+https://github.com/vpavlin/reflection?rev=cff95b5c6ee771b504e714e9c12eaf07e62fa99e#cff95b5c6ee771b504e714e9c12eaf07e62fa99e"
 dependencies = [
  "chrono",
  "ciborium",
