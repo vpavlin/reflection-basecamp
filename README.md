@@ -49,17 +49,26 @@ budget, by kind, and per note. It is a debug tool: set `debugTools` to `false` i
 The editor colours Markdown syntax (headings, emphasis, code, links, lists, quotes). The text
 itself stays plain, as in the GTK app.
 
-## p2panda and the bridge (0.4)
+## Networks: Logos, p2panda or both (0.6)
 
 `p2panda_core` is a shared p2panda node for Basecamp apps, one per app network, and the `p2panda`
-app is its view ([ADR 0001](docs/adr/0001-p2panda-core-module.md)). Reflection can sync through
-it instead of Logos Delivery: *Message stats > Sync network > p2panda*, then restart Basecamp. It
-is then on the same network as upstream Reflection (the GTK app from Flathub).
+app is its view ([ADR 0001](docs/adr/0001-p2panda-core-module.md)). Next to an open note,
+**Networks** chooses where Reflection syncs, and switches at once:
 
-In p2panda mode each note has an **Also on Logos** switch: it asks `p2panda_core` to bridge the
-note to Logos Delivery, so Reflection users on Logos see it too. Nothing is bridged until you
-approve it in the p2panda app (Allow / Refuse / Stop), because the bridge spends this device's
-Logos messages.
+- **Logos** (default): Logos Delivery through `loam_core`.
+- **p2panda**: through `p2panda_core`, the network of upstream Reflection (the GTK app from
+  Flathub).
+- **Both**: every edit goes out over both, and what arrives on one network is passed on to the
+  other, so people on only Logos and people on only p2panda edit the same note through any
+  device on Both. They are the same signed operations on both networks. Only Logos messages
+  count against the message budget.
+
+The status line at the bottom of the sidebar shows each network's peers. Apps that use
+`reflection_core` (Fileverse) set it with `set_settings({"networks": ...})` and read
+`state().networks` and `state().networkStatus`.
+
+The per-note bridge of 0.4/0.5 (approve each note in the p2panda app) is no longer used by
+Reflection; it stays in `p2panda_core` for other p2panda apps.
 
 ## Building
 

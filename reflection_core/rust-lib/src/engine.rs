@@ -56,18 +56,34 @@ pub struct Settings {
     pub budget: Option<u64>,
     /// Send our cursor position to the others on the open note.
     pub share_cursor: bool,
-    /// "logos" (Logos Delivery through loam_core, the default) or "p2panda" (p2panda_core: the
-    /// network of upstream Reflection, with notes bridged to Logos on request). Takes effect when
-    /// Reflection starts.
+    /// The networks notes sync over: "logos" (Logos Delivery through loam_core, the default),
+    /// "p2panda" (p2panda_core: the network of upstream Reflection) or "both" (every edit goes
+    /// out over both, and what arrives on one is passed on to the other). Switches live.
+    pub networks: Option<String>,
+    /// Before 0.6.0: "logos" or "p2panda". Read when `networks` is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_mode: Option<String>,
 }
 
+/// The values of the `networks` setting.
+pub const NETWORKS: [&str; 3] = ["logos", "p2panda", "both"];
+
 impl Settings {
+    /// The networks in use: "logos", "p2panda" or "both".
     pub fn mode(&self) -> &str {
-        match self.sync_mode.as_deref() {
+        match self.networks.as_deref().or(self.sync_mode.as_deref()) {
             Some("p2panda") => "p2panda",
+            Some("both") => "both",
             _ => "logos",
         }
+    }
+
+    /// As the API shows them: `networks` always set.
+    fn shown(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        value["networks"] = json!(self.mode());
+        value["syncMode"] = json!(self.mode());
+        value
     }
 }
 
@@ -259,7 +275,7 @@ impl Engine {
     }
 
     pub fn settings(&self) -> Value {
-        json!({ "ok": true, "settings": *self.inner.settings.lock().unwrap() })
+        json!({ "ok": true, "settings": self.inner.settings.lock().unwrap().shown() })
     }
 
     /// Change settings: a JSON object with any of `budget` (a number, or null for no limit)
@@ -288,11 +304,20 @@ impl Engine {
             };
         }
         let mut stop_sharing = false;
-        if let Some(mode) = changes.get("syncMode").and_then(Value::as_str) {
-            if mode != "logos" && mode != "p2panda" {
-                return Err("syncMode is \"logos\" or \"p2panda\"".into());
+        // `syncMode` is the name before 0.6.0.
+        if let Some(mode) = changes
+            .get("networks")
+            .or_else(|| changes.get("syncMode"))
+            .and_then(Value::as_str)
+        {
+            if !NETWORKS.contains(&mode) {
+                return Err("networks is \"logos\", \"p2panda\" or \"both\"".into());
             }
-            settings.sync_mode = Some(mode.to_owned());
+            if mode != "logos" && self.inner.panda.is_none() {
+                return Err("p2panda needs the p2panda_core module".into());
+            }
+            settings.networks = Some(mode.to_owned());
+            settings.sync_mode = None;
         }
         if let Some(share) = changes.get("shareCursor").and_then(Value::as_bool) {
             stop_sharing = settings.share_cursor && !share;
@@ -320,7 +345,7 @@ impl Engine {
             let inner = self.inner.clone();
             self.rt.spawn(async move { inner.switch_node().await });
         }
-        Ok(json!({ "ok": true, "settings": settings, "switching": switch }))
+        Ok(json!({ "ok": true, "settings": settings.shown(), "switching": switch }))
     }
 
     /// Ask to carry a note over Logos as well (p2panda mode): it stays pending until the user
@@ -328,7 +353,9 @@ impl Engine {
     pub fn bridge(&self, doc_id: &str, on: bool) -> Result<Value, String> {
         let doc = self.doc(doc_id).ok_or("No such note")?;
         if self.inner.running_mode.lock().unwrap().as_str() != "p2panda" {
-            return Err("Bridging is for p2panda mode (Message stats > Sync)".into());
+            return Err(
+                "Bridging is for networks \"p2panda\"; use networks \"both\" instead".into(),
+            );
         }
         let panda = self
             .inner
@@ -396,7 +423,7 @@ impl Engine {
         let settings = self.inner.settings.lock().unwrap().clone();
         json!({
             "ok": true,
-            "settings": settings,
+            "settings": settings.shown(),
             "budget": settings.budget,
             "publishInterval": spend.publish_wait().as_secs_f64(),
             "cursorInterval": spend.cursor_wait().map(|d| d.as_secs_f64()),
@@ -444,17 +471,43 @@ impl Engine {
             (None, Some(_)) => "ready".to_owned(),
             (None, None) => "starting".to_owned(),
         };
+        let running = self.inner.running_mode.lock().unwrap().clone();
         json!({
             "ok": true,
             "node": node,
             "me": *self.inner.me.lock().unwrap(),
             "transport": *self.inner.transport.lock().unwrap(),
-            "settings": *self.inner.settings.lock().unwrap(),
-            "syncMode": *self.inner.running_mode.lock().unwrap(),
+            "settings": self.inner.settings.lock().unwrap().shown(),
+            // The networks the running node uses (the setting may be switching to others).
+            "networks": running,
+            "syncMode": running,
+            "networkStatus": self.network_status(&running),
             "p2pandaAvailable": self.inner.panda.is_some(),
             "docs": list,
             "current": current,
         })
+    }
+
+    /// Each network's state: `{logos: {used, connected, peers, status}, p2panda: {used,
+    /// connected, peers, open, error}}`. p2panda peers are those it synced with in the last five
+    /// minutes.
+    fn network_status(&self, running: &str) -> Value {
+        let transport = self.inner.transport.lock().unwrap().clone();
+        let logos_peers = transport["metrics"]["peers"].as_i64().unwrap_or(-1).max(0);
+        let logos = json!({
+            "used": running == "logos" || running == "both",
+            "connected": transport["connected"].as_bool().unwrap_or(false),
+            "peers": logos_peers,
+            "status": transport["status"],
+        });
+        let mut p2panda = match &self.inner.panda {
+            Some(panda) => panda.status.lock().unwrap().to_json(),
+            None => {
+                json!({ "open": false, "connected": false, "peers": 0, "error": "p2panda_core is not installed" })
+            }
+        };
+        p2panda["used"] = json!(running == "p2panda" || running == "both");
+        json!({ "logos": logos, "p2panda": p2panda })
     }
 
     /// A new document, with `title` as its first line.
@@ -617,7 +670,20 @@ impl Inner {
                     .await
                     .map_err(|e| e.to_string())?
             }
-            ("p2panda", None) => return Err("p2panda mode needs the p2panda_core module".into()),
+            ("both", Some(panda)) => {
+                let network = Hash::digest(NETWORK_NAME);
+                panda
+                    .network_open(network.to_hex(), key.to_hex())
+                    .await
+                    .map_err(|e| format!("p2panda_core: {e}"))?;
+                info!("syncing over Logos Delivery and p2panda");
+                Node::with_dual(key, network, Some(&persist_dir), bus, panda.clone())
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            ("p2panda" | "both", None) => {
+                return Err("p2panda needs the p2panda_core module".into())
+            }
             _ => Node::with_delivery_bus(key, Hash::digest(NETWORK_NAME), Some(&persist_dir), bus)
                 .await
                 .map_err(|e| e.to_string())?,
@@ -1695,6 +1761,31 @@ mod tests {
         assert_eq!(a.stats()["stats"]["budget"], 250);
         a.set_settings(r#"{"budget": null}"#).unwrap();
         assert_eq!(a.stats()["stats"]["budget"], Value::Null);
+    }
+
+    #[test]
+    fn networks_setting() {
+        let dir = tempdir("networks");
+        let a = device(&dir);
+        // Default, shown under both names.
+        assert_eq!(a.settings()["settings"]["networks"], "logos");
+        assert_eq!(a.state("")["networks"], "logos");
+        assert_eq!(a.state("")["networkStatus"]["logos"]["used"], true);
+        assert_eq!(a.state("")["networkStatus"]["p2panda"]["used"], false);
+        assert!(a.set_settings(r#"{"networks": "carrier pigeon"}"#).is_err());
+        // Without p2panda_core, only Logos.
+        assert!(a.set_settings(r#"{"networks": "both"}"#).is_err());
+        assert!(a.set_settings(r#"{"syncMode": "p2panda"}"#).is_err());
+        a.set_settings(r#"{"networks": "logos"}"#).unwrap();
+        assert_eq!(a.settings()["settings"]["networks"], "logos");
+
+        // A settings file from before 0.6.0 is read through `syncMode`.
+        let old = tempdir("networks-old");
+        std::fs::write(old.join("settings.json"), r#"{"syncMode": "p2panda"}"#).unwrap();
+        let settings: Settings =
+            serde_json::from_slice(&std::fs::read(old.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings.mode(), "p2panda");
+        assert_eq!(settings.shown()["networks"], "p2panda");
     }
 
     #[test]

@@ -144,6 +144,7 @@ impl ReflectionCoreModule for Core {
 /// The p2panda_core thread, and the listener of its events.
 fn spawn_panda(bus: Arc<PandaBus>, commands: std::sync::mpsc::Receiver<panda::Command>) {
     let events = bus.sender();
+    let status = bus.status.clone();
     let spawned = std::thread::Builder::new()
         .name("reflection-panda".into())
         .spawn(move || {
@@ -153,6 +154,7 @@ fn spawn_panda(bus: Arc<PandaBus>, commands: std::sync::mpsc::Receiver<panda::Co
                     client: modules().p2panda_core,
                 },
                 commands,
+                status,
             );
         });
     if let Err(error) = spawned {
@@ -244,6 +246,9 @@ impl PandaApi for GeneratedPanda {
             self.client
                 .set_active(sub, if active { "true" } else { "false" }),
         )
+    }
+    fn import(&mut self, sub: &str, header_b64: &str, body_b64: &str) -> Result<Value, String> {
+        object(self.client.import(sub, header_b64, body_b64))
     }
     fn bridge(&mut self, sub: &str, on: bool) -> Result<Value, String> {
         object(self.client.bridge(sub, if on { "true" } else { "false" }))

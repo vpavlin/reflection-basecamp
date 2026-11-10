@@ -30,7 +30,7 @@ Item {
     readonly property color cCode: tok(pal.success, "#7fc79a")
     readonly property color cLink: "#8ab4f8"
     readonly property color cEmph: "#e9b97a"
-    readonly property string viewVersion: "0.5.0"
+    readonly property string viewVersion: "0.6.0"
 
     // Build switches. `debugTools` shows the message-stats button (how many Logos messages this
     // device sends, mapped to the RLN budget); set it to false for a build without it.
@@ -186,7 +186,6 @@ Item {
         if (debounce.running) { debounce.stop(); root.sendEdit() }
         root.currentId = id
         root.confirmRemove = false
-        root.confirmSwitch = false
         var c = detail
         root.applyingRemote = true
         editor.text = c ? c.text : ""
@@ -278,10 +277,16 @@ Item {
         var node = String(root.st.node || "")
         if (node.indexOf("error") === 0) return "Engine " + node
         var t = root.transport.status || "starting"
-        if (root.p2pandaMode) return "Syncing over p2panda (Logos: " + t + ")"
+        if (root.networks !== "logos") return root.networksText()
         return "Logos: " + t + root.peersText()
     }
-    function statusGood() { return !!root.transport.connected && String(root.st.node) === "ready" }
+    function statusGood() {
+        if (String(root.st.node) !== "ready") return false
+        var ns = root.st.networkStatus || {}
+        if (root.networks === "p2panda") return !!(ns.p2panda && ns.p2panda.connected)
+        if (root.networks === "both") return !!root.transport.connected || !!(ns.p2panda && ns.p2panda.connected)
+        return !!root.transport.connected
+    }
 
     // ── message stats (debug)
     property bool showStats: false
@@ -305,7 +310,7 @@ Item {
             if (!r.ok) { root.say(r.error || "Could not change the setting", true); return }
             root.settingsSeq++
             root.st = Object.assign({}, root.st, { settings: r.settings })
-            if (r.switching) root.say("Switching the sync network...")
+            if (r.switching) root.say("Switching networks...")
             if (done) done()
             if (root.showStats) root.refreshStats()
         })
@@ -417,32 +422,20 @@ Item {
         MouseArea { id: toggleHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: toggle.toggled() }
     }
 
-    readonly property bool p2pandaMode: st.syncMode === "p2panda"
-    readonly property string bridgeState: (root.current && root.current.bridge) ? root.current.bridge : "off"
-    // On Logos, a note reaches p2panda through the bridge, which runs on the p2panda side: so
-    // "Also on p2panda" switches Reflection to p2panda and then asks to bridge this note.
-    property bool confirmSwitch: false
-    property string bridgeAfterSwitch: ""
-    function bridgeFromLogos() {
-        if (!root.confirmSwitch) { root.confirmSwitch = true; return }
-        root.confirmSwitch = false
-        root.bridgeAfterSwitch = root.currentId
-        root.setSettings({ syncMode: "p2panda" })
-    }
-    onP2pandaModeChanged: {
-        if (root.p2pandaMode && root.bridgeAfterSwitch !== "" && root.bridgeAfterSwitch === root.currentId) {
-            root.bridgeAfterSwitch = ""
-            if (root.bridgeState === "off") root.toggleBridge()
+    // The networks notes sync over (reflection_core 0.6.0 `networks`): Logos, p2panda or both.
+    readonly property string networks: st.networks || st.syncMode || "logos"
+    readonly property string chosenNetworks: (root.settings && (root.settings.networks || root.settings.syncMode)) || "logos"
+    readonly property bool p2pandaMode: root.networks === "p2panda"
+    readonly property var networkChoices: [["logos", "Logos"], ["p2panda", "p2panda"], ["both", "Both"]]
+    function networksText() {
+        var ns = root.st.networkStatus || {}
+        function one(name, s) {
+            if (!s) return name + ": ?"
+            return name + ": " + (s.connected ? (s.peers + " peers") : (s.open === false && s.error ? "off" : "connecting"))
         }
-    }
-    function toggleBridge() {
-        var on = root.bridgeState === "off"
-        root.core("bridge_note", [root.currentId, on ? "true" : "false"], function (raw) {
-            var r = root.parse(raw)
-            if (!r || !r.ok) { root.say((r && r.error) || "Could not change bridging", true); return }
-            root.say(on ? "Asked to bridge this note to Logos. Approve it in the p2panda app." : "This note is no longer bridged to Logos.")
-            root.refresh()
-        })
+        if (root.networks === "both") return one("Logos", ns.logos) + " · " + one("p2panda", ns.p2panda)
+        if (root.networks === "p2panda") return one("p2panda", ns.p2panda)
+        return ""
     }
 
     component RLabel: Text { color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText; elide: Text.ElideRight }
@@ -609,7 +602,7 @@ Item {
                 LogosButton { text: root.confirmRemove ? "Really remove?" : "Remove"; Layout.preferredWidth: 120; Layout.preferredHeight: 34; onClicked: root.removeDoc() }
             }
 
-            // note switches: cursor sharing, and the bridge between Logos and p2panda
+            // note switches: cursor sharing, and the networks notes sync over
             RowLayout {
                 Layout.fillWidth: true
                 visible: root.currentId !== ""
@@ -646,18 +639,17 @@ Item {
                         onClicked: root.setSettings({ shareCursor: !root.settings.shareCursor }, function () { cursorDebounce.restart() })
                     }
                 }
-                RToggle {
-                    visible: root.p2pandaMode
-                    on: root.bridgeState !== "off"
-                    label: root.bridgeState === "pending" ? "Also on Logos (approve in p2panda)" : "Also on Logos"
-                    onToggled: root.toggleBridge()
-                }
-                RToggle {
-                    visible: !root.p2pandaMode && !!root.st.p2pandaAvailable
-                    on: root.confirmSwitch || root.bridgeAfterSwitch === root.currentId
-                    label: root.bridgeAfterSwitch === root.currentId ? "Also on p2panda (switching...)"
-                         : (root.confirmSwitch ? "Switch Reflection to p2panda?" : "Also on p2panda")
-                    onToggled: root.bridgeFromLogos()
+                RLabel { text: "Networks"; visible: !!root.st.p2pandaAvailable }
+                Repeater {
+                    model: !!root.st.p2pandaAvailable ? root.networkChoices : []
+                    delegate: LogosButton {
+                        required property var modelData
+                        text: ((root.chosenNetworks === modelData[0]) ? "● " : "") + modelData[1]
+                        Layout.preferredHeight: 30
+                        Layout.preferredWidth: 84
+                        Layout.fillWidth: false
+                        onClicked: root.setSettings({ networks: modelData[0] })
+                    }
                 }
                 Item { Layout.fillWidth: true }
             }
@@ -928,34 +920,19 @@ Item {
                             text: "Not enforced by the network yet. Past the limit nothing more is sent this epoch (as RLN would drop it); edits slow down from half of it. Empty: no limit."
                         }
 
-                        // which network Reflection syncs over
-                        RLabel { Layout.fillWidth: true; Layout.topMargin: 8; text: "Sync network"; color: root.cText }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            Repeater {
-                                model: [["logos", "Logos Delivery"], ["p2panda", "p2panda"]]
-                                delegate: LogosButton {
-                                    required property var modelData
-                                    text: (((root.settings.syncMode || "logos") === modelData[0]) ? "● " : "") + modelData[1]
-                                    Layout.preferredHeight: 30
-                                    enabled: modelData[0] !== "p2panda" || !!root.st.p2pandaAvailable
-                                    onClicked: root.setSettings({ syncMode: modelData[0] })
-                                }
-                            }
-                        }
+                        // which networks Reflection syncs over (chosen next to the note)
                         RLabel {
                             Layout.fillWidth: true
+                            Layout.topMargin: 8
                             wrapMode: Text.Wrap
                             elide: Text.ElideNone
                             font.pixelSize: 10
                             color: root.cFaint
                             text: {
-                                var running = root.st.syncMode || "logos"
-                                var chosen = root.settings.syncMode || "logos"
-                                var t = "Running on " + (running === "p2panda" ? "p2panda (the network of upstream Reflection)" : "Logos Delivery") + "."
-                                if (chosen !== running) t += " Switching to " + (chosen === "p2panda" ? "p2panda" : "Logos Delivery") + "..."
-                                if (running === "p2panda") t += " On p2panda, a note reaches Logos users only if you bridge it (the switch on the note) and approve it in the p2panda app; the bridge spends this device's Logos messages."
+                                var names = { logos: "Logos Delivery", p2panda: "p2panda (the network of upstream Reflection)", both: "Logos Delivery and p2panda" }
+                                var t = "Syncing over " + (names[root.networks] || root.networks) + "."
+                                if (root.chosenNetworks !== root.networks) t += " Switching to " + (names[root.chosenNetworks] || root.chosenNetworks) + "..."
+                                if (root.networks === "both") t += " Every edit goes out on both, and what arrives on one is passed on to the other. Only Logos messages count against the budget."
                                 return t
                             }
                         }

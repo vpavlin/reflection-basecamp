@@ -28,6 +28,7 @@ pub trait PandaApi: Send + 'static {
     fn publish(&mut self, sub: &str, message_b64: &str, prune: bool) -> Result<Value, String>;
     fn ephemeral(&mut self, sub: &str, message_b64: &str) -> Result<Value, String>;
     fn set_active(&mut self, sub: &str, active: bool) -> Result<Value, String>;
+    fn import(&mut self, sub: &str, header_b64: &str, body_b64: &str) -> Result<Value, String>;
     fn bridge(&mut self, sub: &str, on: bool) -> Result<Value, String>;
     fn bridges(&mut self) -> Result<Value, String>;
 }
@@ -59,6 +60,13 @@ pub enum Command {
         topic: Topic,
         active: bool,
     },
+    /// Import a signed operation from Logos (networks "both").
+    Import {
+        topic: Topic,
+        header: Vec<u8>,
+        body: Option<Vec<u8>>,
+        reply: Reply<()>,
+    },
     Bridge {
         topic: Topic,
         on: bool,
@@ -79,15 +87,50 @@ pub enum Command {
     },
 }
 
+/// What the p2panda side looks like, for the user: whether the network is open, and the peers
+/// p2panda synced with lately (from the subscriptions' sync events).
+#[derive(Default)]
+pub struct PandaStatus {
+    pub open: bool,
+    pub error: Option<String>,
+    pub peers: HashMap<String, Instant>,
+}
+
+/// A peer counts as connected this long after its last sync session event.
+const PEER_FRESH: Duration = Duration::from_secs(300);
+
+impl PandaStatus {
+    pub fn to_json(&self) -> Value {
+        let peers = self
+            .peers
+            .values()
+            .filter(|at| at.elapsed() < PEER_FRESH)
+            .count();
+        serde_json::json!({
+            "open": self.open,
+            "connected": self.open && peers > 0,
+            "peers": peers,
+            "error": self.error,
+        })
+    }
+}
+
 /// The bus the engine sees.
 pub struct PandaBus {
     commands: mpsc::Sender<Command>,
+    pub status: Arc<std::sync::Mutex<PandaStatus>>,
 }
 
 impl PandaBus {
     pub fn new() -> (Arc<Self>, mpsc::Receiver<Command>) {
         let (commands, rx) = mpsc::channel();
-        (Arc::new(Self { commands }), rx)
+        (
+            Arc::new(Self {
+                commands,
+                status: Arc::default(),
+            }),
+            rx,
+        )
     }
 
     pub fn sender(&self) -> mpsc::Sender<Command> {
@@ -161,6 +204,20 @@ impl P2pandaBus for PandaBus {
         let _ = self.commands.send(Command::SetActive { topic, active });
         Box::pin(async {})
     }
+
+    fn import(
+        &self,
+        topic: Topic,
+        header: Vec<u8>,
+        body: Option<Vec<u8>>,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(self.ask(move |reply| Command::Import {
+            topic,
+            header,
+            body,
+            reply,
+        }))
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -180,6 +237,11 @@ fn item(value: &Value) -> Option<P2pandaItem> {
             hash: value["hash"].as_str()?.parse::<Hash>().ok()?,
             author,
             message,
+            // p2panda_core API 2: the signed operation, to pass it on to Logos.
+            signed: value["header"]
+                .as_str()
+                .and_then(unb64)
+                .map(|header| (header, value["body"].as_str().and_then(unb64))),
         }),
         "ephemeral" => Some(P2pandaItem::Ephemeral {
             author,
@@ -199,7 +261,11 @@ struct Open {
 }
 
 /// The p2panda thread: runs until the bus is dropped.
-pub fn run<A: PandaApi>(mut api: A, commands: mpsc::Receiver<Command>) {
+pub fn run<A: PandaApi>(
+    mut api: A,
+    commands: mpsc::Receiver<Command>,
+    status: Arc<std::sync::Mutex<PandaStatus>>,
+) {
     let mut network: Option<(String, String)> = None;
     let mut topics: HashMap<Topic, Open> = HashMap::new();
     let mut labels: HashMap<Topic, String> = HashMap::new();
@@ -231,6 +297,17 @@ pub fn run<A: PandaApi>(mut api: A, commands: mpsc::Receiver<Command>) {
                     }
                 };
                 for value in reply["items"].as_array().into_iter().flatten() {
+                    if value["kind"] == "sync" {
+                        if let Some(remote) = value["remote"].as_str() {
+                            let mut status = status.lock().unwrap();
+                            if value["state"] == "failed" {
+                                status.peers.remove(remote);
+                            } else {
+                                status.peers.insert(remote.to_owned(), Instant::now());
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(item) = item(value) {
                         let _ = open.tx.send(item);
                     }
@@ -248,6 +325,11 @@ pub fn run<A: PandaApi>(mut api: A, commands: mpsc::Receiver<Command>) {
                 reply,
             }) => {
                 let result = api.network_open(&id, &key).map(|_| ());
+                {
+                    let mut status = status.lock().unwrap();
+                    status.open = result.is_ok();
+                    status.error = result.as_ref().err().cloned();
+                }
                 if result.is_ok() {
                     network = Some((id, key));
                 }
@@ -295,6 +377,24 @@ pub fn run<A: PandaApi>(mut api: A, commands: mpsc::Receiver<Command>) {
                 let result = match topics.get(&topic) {
                     None => Err("note not open in p2panda_core".to_owned()),
                     Some(open) => api.ephemeral(&open.sub, &b64(&message)).map(|_| ()),
+                };
+                let _ = reply.send(result);
+            }
+            Ok(Command::Import {
+                topic,
+                header,
+                body,
+                reply,
+            }) => {
+                let result = match topics.get(&topic) {
+                    None => Err("note not open in p2panda_core".to_owned()),
+                    Some(open) => api
+                        .import(
+                            &open.sub,
+                            &b64(&header),
+                            &body.as_deref().map(b64).unwrap_or_default(),
+                        )
+                        .map(|_| ()),
                 };
                 let _ = reply.send(result);
             }

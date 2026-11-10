@@ -1186905,18 +1186905,18 @@
       },
       "locked": {
         "dir": "p2panda_core",
-        "lastModified": 1794140300,
-        "narHash": "sha256-rOAhyCsF8sbIaIrc84VMpPv0uzZsQrU2f38V3IjYNCA=",
+        "lastModified": 1794305856,
+        "narHash": "sha256-FMQBWLqq1NXiHcKiAec6MmJWkaUIH5PMJj75E+0qK0U=",
         "owner": "vpavlin",
         "repo": "reflection-basecamp",
-        "rev": "7ccf2ac3b4a9c28fc4d45a8dab7fc2b69d059fd0",
+        "rev": "933e3f61028902b201d1b6391b71da48958995c8",
         "type": "github"
       },
       "original": {
         "dir": "p2panda_core",
         "owner": "vpavlin",
         "repo": "reflection-basecamp",
-        "rev": "7ccf2ac3b4a9c28fc4d45a8dab7fc2b69d059fd0",
+        "rev": "933e3f61028902b201d1b6391b71da48958995c8",
         "type": "github"
       }
     },

@@ -1,8 +1,9 @@
 //! Reflection for Logos Basecamp: collaborative notes that sync over Logos Delivery.
 //!
 //! The engine is p2panda's Reflection (`reflection-node`, Logos backend) with the document
-//! layer of the GTK app re-done without glib (see `engine`). Transport is loam_core, the
-//! host's shared Logos node (see `loam`).
+//! layer of the GTK app re-done without glib (see `engine`). Transports are loam_core, the
+//! host's shared Logos node (see `loam`), and p2panda_core, its shared p2panda node (see
+//! `panda`): one of them or both (setting `networks`).
 //!
 //! The trait below is the module's contract: the builder derives the `.lidl` from it. Every
 //! method returns a JSON object, `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
@@ -13,7 +14,10 @@ mod panda;
 
 /// The methods the Reflection view calls.
 pub trait ReflectionCoreModule: Send + 'static {
-    /// The list of notes, transport status, and the open note when `doc_id` is not empty.
+    /// The list of notes, transport status, and the open note when `doc_id` is not empty. Also
+    /// `networks` (the networks in use: "logos", "p2panda" or "both") and `networkStatus`
+    /// (`{logos: {used, connected, peers, status}, p2panda: {used, connected, peers, open,
+    /// error}}`).
     fn state(&mut self, doc_id: String) -> String;
 
     /// A new note whose first line is `title`. Returns its id and content.
@@ -42,14 +46,15 @@ pub trait ReflectionCoreModule: Send + 'static {
         anchor: String,
     ) -> String;
 
-    /// Settings: `budget` (pretend messages per RLN epoch, null for no limit), `shareCursor`.
+    /// Settings: `budget` (pretend messages per RLN epoch, null for no limit), `shareCursor`,
+    /// `networks` ("logos", the default, "p2panda" or "both"; `syncMode` is its old name).
     fn settings(&mut self) -> String;
 
     /// Change settings, given as a JSON object with any of the keys of `settings`.
     fn set_settings(&mut self, changes: String) -> String;
 
-    /// p2panda mode: ask ("true") to carry a note over Logos Delivery as well (pending until the
-    /// user confirms it in the p2panda view), or stop ("false").
+    /// Networks "p2panda" only, kept for compatibility: ask p2panda_core to bridge a note to Logos
+    /// (pending until the user confirms it in the p2panda view). Use networks "both" instead.
     fn bridge_note(&mut self, doc_id: String, on: String) -> String;
 
     /// Called once the module is wired to the host.

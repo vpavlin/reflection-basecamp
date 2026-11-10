@@ -1,7 +1,9 @@
 # ADR 0001: `p2panda_core`, a shared p2panda node for Basecamp apps
 
 Status: accepted (2026-11-08). Owner decisions recorded, design review (laptop/reviewer,
-2026-11-08) taken in; see "Review" at the end for what changed.
+2026-11-08) taken in; see "Review" at the end for what changed. **Amended 2026-11-10** (owner):
+Reflection no longer uses the bridge; `reflection_core` speaks both networks itself (section 5,
+and "Amendment" at the end).
 
 ## Context
 
@@ -205,6 +207,9 @@ reach this way, without knowing Logos exists.
 
 ### 5. `reflection_core` on top
 
+*(Amended 2026-11-10: the third option is now "both, spoken by `reflection_core` itself", not
+"both, bridged"; see "Amendment" at the end.)*
+
 `reflection-node` gets a backend that talks to an external p2panda node through a small trait
 (`P2pandaBus`: open, publish, prune, import, ephemeral, events), the way `DeliveryBus` abstracts
 Logos. `reflection_core` implements it over IPC to `p2panda_core`. Reflection in Basecamp then
@@ -256,9 +261,10 @@ Basecamp runs one `p2panda_core` and every p2panda app on the device uses it. So
 
 ## Alternatives considered
 
-- **Bridge inside `reflection_core`** (`Node::with_bridge` on `loam_core`'s bus). Smallest change,
-  and `reflection_core` already links p2panda. Helps Reflection only, and every other p2panda app
-  would carry its own p2panda node and its own bridge. Kept as the fallback if this is rejected.
+- **`reflection_core` speaks both networks** (was "bridge inside `reflection_core`"). Rejected on
+  2026-11-08 because it helps Reflection only; **adopted for Reflection on 2026-11-10** (see
+  "Amendment"), now through `p2panda_core`'s shared node rather than a p2panda node of its own, so
+  the argument about every app carrying its own node no longer applies.
 - **Each p2panda app links p2panda itself.** Several iroh endpoints and stores per device, and
   every app breaks with the next p2panda API change.
 - **A bridge module without p2panda inside** (Logos to an external p2panda node). There is no
@@ -367,3 +373,42 @@ What was built differs from the text above in these points:
   in about 4 s) and a confirmed bridge relaying through `loam_core`; upstream Reflection's tests
   through the external backend (`REFLECTION_BACKEND=p2panda-external`).
 
+
+## Amendment: `reflection_core` speaks both networks (owner, 2026-11-10)
+
+Decision: Reflection (and Fileverse through it) chooses its networks by a setting and publishes
+to one or both itself. It no longer uses `p2panda_core`'s per-note bridge.
+
+Why (vpavlin):
+- **Transports are plain pipes**, like Logos Delivery: an app sends, it publishes. The bridge made
+  every note wait for an approval in the p2panda view, an approval Logos Delivery doesn't ask
+  for.
+- **One app to click.** Choosing "both" in Reflection is the whole setup; no trip through the
+  p2panda app per note.
+- **Basecamp has no module-to-module identity yet**, so `p2panda_core` can't tell that the
+  module asking to bridge is Reflection. That is why the bridge needed the user's confirmation
+  for every topic; it isn't needed when the app publishes on each network itself.
+
+How (reflection_core 0.6.0, p2panda_core 0.2.0, fork `reflection-node` `DualBackend`):
+- Setting `networks`: `"logos"` (default) | `"p2panda"` | `"both"`, switched live
+  (`set_settings`, which still accepts the old `syncMode`). `settings()` and `state()` report it;
+  `state().networkStatus` gives each network's `used`, `connected` and `peers`.
+- With `"both"`, `reflection_core` runs the fork's `Node::with_dual`: every edit is written once,
+  through Logos Delivery (`loam_core`), and the **same signed operation** is imported into
+  `p2panda_core` (new `import` method, API 2), which syncs it to p2panda peers. Operations from
+  Logos peers are imported into p2panda too; operations from p2panda peers (whose items now carry
+  the signed operation, `header`/`body`) are relayed to Logos, collected per author for 15 s as
+  the bridge does. A Logos-only peer and a p2panda-only peer (e.g. the GTK Reflection from
+  Flathub) meet through any device on "both". The application sees each operation once.
+- The Logos wire format is unchanged: since fork ADR 0007 a Logos operation's body is encoded as
+  p2panda encodes it, so an operation has the same hash and signature on both networks, and
+  duplicates are dropped by hash on each side.
+- Only Logos sends count against the (pretend) RLN budget; p2panda sends don't.
+- Ephemeral messages (presence, cursors) are signed per network: sent on both, received from both.
+- The bridge and its approvals stay in `p2panda_core` for other p2panda apps.
+
+Known limit: an author's log must be one log. A note this device edited both in "logos" and
+later in "p2panda" mode (0.4/0.5) has two different logs of the same author, one per network;
+in "both" the second one is rejected by the other side as a fork. Its text still converges
+locally, but the edits on the rejected log don't cross. Notes edited only on one network (every
+note on the default "logos") are not affected.

@@ -70,13 +70,17 @@ QString FakeCore::callModule(const QString &mod, const QString &method, const QV
         r["docs"] = list; r["node"] = "ready"; r["me"] = "cafe1234";
         r["transport"] = QJsonObject{{"status", "Connected"}, {"connected", true}, {"metrics", QJsonObject{{"peers", 6}}}};
         r["current"] = docs.contains(arg(0)) ? QJsonValue(detail(arg(0), docs[arg(0)])) : QJsonValue();
-        r["settings"] = QJsonObject{{"budget", QJsonValue()}, {"shareCursor", shareCursor}, {"syncMode", syncMode}};
-        r["syncMode"] = syncMode; r["p2pandaAvailable"] = true;
+        r["settings"] = QJsonObject{{"budget", QJsonValue()}, {"shareCursor", shareCursor}, {"networks", syncMode}, {"syncMode", syncMode}};
+        r["networks"] = syncMode; r["syncMode"] = syncMode; r["p2pandaAvailable"] = true;
+        r["networkStatus"] = QJsonObject{
+            {"logos", QJsonObject{{"used", syncMode != "p2panda"}, {"connected", true}, {"peers", 7}, {"status", "Connected"}}},
+            {"p2panda", QJsonObject{{"used", syncMode != "logos"}, {"open", syncMode != "logos"}, {"connected", syncMode != "logos"}, {"peers", 2}}}};
     } else if (method == "set_settings") {
         QJsonObject c = QJsonDocument::fromJson(arg(0).toUtf8()).object();
         if (c.contains("shareCursor")) shareCursor = c["shareCursor"].toBool();
         if (c.contains("syncMode")) { syncMode = c["syncMode"].toString(); r["switching"] = true; }
-        r["settings"] = QJsonObject{{"budget", c.contains("budget") ? c["budget"] : QJsonValue()}, {"shareCursor", shareCursor}, {"syncMode", syncMode}};
+        if (c.contains("networks")) { syncMode = c["networks"].toString(); r["switching"] = true; }
+        r["settings"] = QJsonObject{{"budget", c.contains("budget") ? c["budget"] : QJsonValue()}, {"shareCursor", shareCursor}, {"networks", syncMode}, {"syncMode", syncMode}};
     } else if (method == "bridge_note") {
         bridgeRequested = arg(1) == "true";
     } else if (method == "set_cursor") {
@@ -278,17 +282,24 @@ int main(int argc, char **argv) {
                                     check(tints.contains(c.name()), "someone else's cursor is drawn in their colour");
                                     fprintf(stderr, "[remote] at %.0f,%.0f colour %s\n", p.x(), p.y(), qPrintable(c.name()));
                                     grab(&view, out + "/09-cursors.png");
-                                    // On Logos, "Also on p2panda" asks, then switches and bridges.
-                                    js(&view, "bridgeFromLogos()");
-                                    check(js(&view, "confirmSwitch").toBool(), "Also on p2panda asks first");
-                                    grab(&view, out + "/10-switch-ask.png");
-                                    js(&view, "bridgeFromLogos()");
-                                    eventually(&view, "p2pandaMode === true", "the view follows the switch to p2panda", 5000, [&] {
+                                    // The Networks choice: Both, then p2panda. No per-note bridge.
+                                    grab(&view, out + "/10-networks-logos.png");
+                                    js(&view, "setSettings({ networks: 'both' })");
+                                    eventually(&view, "networks === 'both'", "the view follows the switch to both networks", 5000, [&] {
                                         QTimer::singleShot(500, [&] {
-                                            check(core->bridgeRequested, "after the switch the note's bridge is requested");
-                                            grab(&view, out + "/11-p2panda.png");
-                                            fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
-                                            QGuiApplication::exit(failures);
+                                            QString st = js(&view, "statusText()").toString();
+                                            check(st.contains("Logos: 7 peers") && st.contains("p2panda: 2 peers"), "the status shows both networks");
+                                            fprintf(stderr, "[status] %s\n", qPrintable(st));
+                                            grab(&view, out + "/11-networks-both.png");
+                                            js(&view, "setSettings({ networks: 'p2panda' })");
+                                            eventually(&view, "p2pandaMode === true", "the view follows the switch to p2panda", 5000, [&] {
+                                                QTimer::singleShot(500, [&] {
+                                                    check(!core->bridgeRequested, "no per-note bridge request");
+                                                    grab(&view, out + "/12-p2panda.png");
+                                                    fprintf(stderr, "[done] failures=%d calls=%d\n", failures, core->calls);
+                                                    QGuiApplication::exit(failures);
+                                                });
+                                            });
                                         });
                                     });
                                 });
