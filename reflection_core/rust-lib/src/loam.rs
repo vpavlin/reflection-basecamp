@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 pub enum Command {
-    Join(String),
+    /// Join a content topic; the sender is told once loam_core has joined it (connected).
+    Join(String, Option<tokio::sync::oneshot::Sender<()>>),
     Send(String, Vec<u8>),
 }
 
@@ -46,11 +47,19 @@ impl LoamBus {
 
 impl DeliveryBus for LoamBus {
     fn subscribe(&self, content_topic: String) -> BoxFuture<'_, Result<(), BusError>> {
+        // Resolves once loam_core has joined the topic, so that the first heads of a note
+        // aren't sent before its answers can come back to us. Not forever: sends are queued
+        // until loam_core connects anyway.
+        let (joined, wait) = tokio::sync::oneshot::channel();
         let result = self
             .commands
-            .send(Command::Join(content_topic))
+            .send(Command::Join(content_topic, Some(joined)))
             .map_err(|_| BusError("transport thread stopped".into()));
-        Box::pin(async move { result })
+        Box::pin(async move {
+            result?;
+            let _ = tokio::time::timeout(JOIN_WAIT, wait).await;
+            Ok(())
+        })
     }
 
     fn unsubscribe(&self, _content_topic: String) -> BoxFuture<'_, Result<(), BusError>> {
@@ -109,10 +118,15 @@ pub trait LoamApi: Send + 'static {
 
 const MAX_QUEUED: usize = 2000;
 
+/// How long subscribing waits for loam_core to confirm the join.
+const JOIN_WAIT: Duration = Duration::from_secs(20);
+
 /// The transport thread: start loam_core, wait until it is connected, then join and send.
 /// `report` receives the transport state for the view.
 pub fn run<A: LoamApi>(mut api: A, commands: mpsc::Receiver<Command>, report: impl Fn(Value)) {
     let mut joined: BTreeSet<String> = BTreeSet::new();
+    // Joins to confirm once loam_core is connected.
+    let mut waiting: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut queue: Vec<(String, Vec<u8>)> = Vec::new();
     let mut connected = false;
     let mut status = String::from("starting");
@@ -145,6 +159,9 @@ pub fn run<A: LoamApi>(mut api: A, commands: mpsc::Receiver<Command>, report: im
                             if let Err(error) = api.join(topic) {
                                 last_error = Some(format!("join: {error}"));
                             }
+                        }
+                        for done in waiting.drain(..) {
+                            let _ = done.send(());
                         }
                         for (topic, payload) in queue.drain(..) {
                             if let Err(error) = api.send(&topic, &encode_b64(&payload)) {
@@ -179,11 +196,18 @@ pub fn run<A: LoamApi>(mut api: A, commands: mpsc::Receiver<Command>, report: im
         }
 
         match commands.recv_timeout(Duration::from_millis(500)) {
-            Ok(Command::Join(topic)) => {
+            Ok(Command::Join(topic, done)) => {
                 if joined.insert(topic.clone()) && started {
                     // Joining before the node is up is fine: loam_core remembers the topic.
                     if let Err(error) = api.join(&topic) {
                         last_error = Some(format!("join: {error}"));
+                    }
+                }
+                if let Some(done) = done {
+                    if connected {
+                        let _ = done.send(());
+                    } else {
+                        waiting.push(done);
                     }
                 }
             }
