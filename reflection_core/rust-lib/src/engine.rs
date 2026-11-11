@@ -435,6 +435,29 @@ impl Engine {
         })
     }
 
+    /// Whether the open note is fully sent and received, as far as this device can tell:
+    /// `unpublished` (own edits not sent yet), `catchingUp` (a peer has operations we lack, or
+    /// some wait for a missing earlier one), `peersMissingOurs` (peers whose last heads lacked
+    /// our edits; they only send heads while catching up, so this can stay stale).
+    fn delivery(&self, doc: &Doc) -> Value {
+        let unpublished = doc.unpublished.load(Ordering::SeqCst) || {
+            let loro = doc.loro.lock().unwrap();
+            Doc::own_counter(&loro) > *doc.published_counter.lock().unwrap()
+                && *doc.published_counter.lock().unwrap() > 0
+        } || doc.publish_scheduled.load(Ordering::SeqCst);
+        let topic = doc.hex();
+        let stats = self.inner.node().and_then(|node| node.transport_stats());
+        let t = stats
+            .as_ref()
+            .and_then(|s| s.topics.iter().find(|t| t.topic == topic));
+        json!({
+            "unpublished": unpublished,
+            "catchingUp": t.is_some_and(|t| t.behind || t.waiting > 0),
+            "waiting": t.map(|t| t.waiting).unwrap_or(0),
+            "peersMissingOurs": t.map(|t| t.peers_missing_ours).unwrap_or(0),
+        })
+    }
+
     /// Transport state shown to the user (set by the module from loam_core).
     pub fn set_transport(&self, transport: Value) {
         *self.inner.transport.lock().unwrap() = transport;
@@ -453,6 +476,7 @@ impl Engine {
             match self.doc(doc_id) {
                 Some(doc) => {
                     let mut detail = doc.detail(&me);
+                    detail["delivery"] = self.delivery(&doc);
                     detail["bridge"] = json!(self
                         .inner
                         .bridge_states
@@ -519,6 +543,11 @@ impl Engine {
             doc.local_edit(None, &format!("{title}\n"))?;
         }
         self.add(doc.clone());
+        if !title.is_empty() {
+            let interval = self.inner.spend().publish_wait();
+            let doc = doc.clone();
+            self.rt.spawn(async move { doc.request_publish(interval) });
+        }
         Ok(json!({ "ok": true, "id": doc.hex(), "current": doc.detail(&self.me()) }))
     }
 
@@ -1247,6 +1276,11 @@ impl Doc {
         let Some(stream) = stream else {
             // Published as part of a snapshot once the note is subscribed.
             self.unpublished.store(true, Ordering::SeqCst);
+            // Unless `subscribe` finished in between and already looked at the flag.
+            if self.stream.lock().unwrap().is_some() && self.unpublished.swap(false, Ordering::SeqCst)
+            {
+                self.publish_snapshot().await;
+            }
             return;
         };
         let (update, counter) = {
