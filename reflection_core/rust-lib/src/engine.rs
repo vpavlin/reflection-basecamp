@@ -438,7 +438,8 @@ impl Engine {
     /// Whether the open note is fully sent and received, as far as this device can tell:
     /// `unpublished` (own edits not sent yet), `catchingUp` (a peer has operations we lack, or
     /// some wait for a missing earlier one), `peersMissingOurs` (peers whose last heads lacked
-    /// our edits; they only send heads while catching up, so this can stay stale).
+    /// our edits; they only send heads while catching up, so this can stay stale), `loroPending`
+    /// (received changes wait for an earlier one we never got: the text shown is incomplete).
     fn delivery(&self, doc: &Doc) -> Value {
         let unpublished = doc.unpublished.load(Ordering::SeqCst) || {
             let loro = doc.loro.lock().unwrap();
@@ -455,6 +456,7 @@ impl Engine {
             "catchingUp": t.is_some_and(|t| t.behind || t.waiting > 0),
             "waiting": t.map(|t| t.waiting).unwrap_or(0),
             "peersMissingOurs": t.map(|t| t.peers_missing_ours).unwrap_or(0),
+            "loroPending": !doc.loro_pending.lock().unwrap().is_empty(),
         })
     }
 
@@ -926,6 +928,8 @@ pub struct Doc {
     stream: Mutex<Option<Arc<TopicStream<DocSubscription>>>>,
     subscribing: AtomicBool,
     unpublished: AtomicBool,
+    /// Received changes Loro holds back for a missing earlier one: peer -> end counter.
+    loro_pending: Mutex<HashMap<u64, i32>>,
     /// Our own Loro changes up to this counter have been published.
     published_counter: Mutex<i32>,
     publish_scheduled: AtomicBool,
@@ -962,6 +966,7 @@ impl Doc {
             stream: Mutex::new(None),
             subscribing: AtomicBool::new(false),
             unpublished: AtomicBool::new(false),
+            loro_pending: Mutex::new(HashMap::new()),
             published_counter: Mutex::new(0),
             publish_scheduled: AtomicBool::new(false),
             last_publish: Mutex::new(None),
@@ -1105,9 +1110,25 @@ impl Doc {
     /// Bytes from another peer: a Loro update or snapshot.
     fn import_remote(&self, bytes: &[u8]) {
         let loro = self.loro.lock().unwrap();
-        if let Err(error) = loro.import_with(bytes, "delta") {
-            warn!(doc = %self.hex(), "received invalid change: {error}");
-            return;
+        let status = match loro.import_with(bytes, "delta") {
+            Ok(status) => status,
+            Err(error) => {
+                warn!(doc = %self.hex(), "received invalid change: {error}");
+                return;
+            }
+        };
+        {
+            // Changes Loro holds back because they depend on ones we don't have: per peer, up
+            // to which counter. Resolved once the oplog reaches that counter.
+            let mut pending = self.loro_pending.lock().unwrap();
+            if let Some(range) = &status.pending {
+                for (peer, (_, end)) in range.iter() {
+                    let e = pending.entry(*peer).or_insert(*end);
+                    *e = (*e).max(*end);
+                }
+            }
+            let vv = loro.oplog_vv();
+            pending.retain(|peer, end| vv.get(peer).copied().unwrap_or(0) < *end);
         }
         // Our own changes coming back (replayed from the store) were published before.
         let ours = Self::own_counter(&loro);
@@ -1554,6 +1575,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("expected {expected:?}, got {:?}", text(engine, id));
+    }
+
+    #[test]
+    fn a_change_waiting_for_a_missing_one_is_reported() {
+        let theirs = LoroDoc::new();
+        let text = theirs.get_text("document");
+        text.insert(0, "Title\n").unwrap();
+        theirs.commit();
+        let first = theirs.export(ExportMode::all_updates()).unwrap();
+        let after_first = theirs.oplog_vv();
+        text.insert(6, "the whole text").unwrap();
+        theirs.commit();
+        let second = theirs.export(ExportMode::updates(&after_first)).unwrap();
+
+        let doc = Doc::new([7; 32]);
+        doc.import_remote(&second);
+        assert!(!doc.loro_pending.lock().unwrap().is_empty());
+        assert_eq!(Doc::text(&doc.loro.lock().unwrap()), "");
+
+        doc.import_remote(&first);
+        assert!(doc.loro_pending.lock().unwrap().is_empty());
+        assert_eq!(Doc::text(&doc.loro.lock().unwrap()), "Title\nthe whole text");
     }
 
     #[test]
